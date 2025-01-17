@@ -109,7 +109,7 @@ The Lora file must be in the *diffusers* format. This function works also on non
 
 The typical workflow wil be:
 1) temporarly insert the *save_model* function just after a model has been fully loaded to save a copy of the model / quantized model.
-2) replace the full initalizing / loading logic with *fast_load_transformers_model* (if there is a *from_pretrained* call to a transformers object) or only the tensor loading functions (*torch.load_model_file* and *torch.load_state_dict*) with *load_model_data after* the initializing logic.
+2) replace the full initializing / loading logic with *fast_load_transformers_model* (if there is a *from_pretrained* call to a transformers object) or only the tensor loading functions (*torch.load_model_file* and *torch.load_state_dict*) with *load_model_data after* the initializing logic.
 
 ## Special cases
 Sometime there isn't an explicit pipe object as each submodel is loaded separately in the main app. If this is the case, you need to create a dictionary that manually maps all the models.\
