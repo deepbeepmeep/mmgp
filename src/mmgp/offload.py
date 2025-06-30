@@ -106,6 +106,8 @@ class clock:
     def __init__(self):
         self.start_time = 0
         self.end_time = 0
+        self.parameters_ref = {}
+        self.cotenants_map = {}
 
     @classmethod
     def start(cls):
@@ -885,7 +887,7 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
             for n, p in module.named_parameters(recurse = False):
                 if tied_w != None and n == tied_w[0]:
                     if isinstance( named_modules[tied_w[1]], QModuleMixin) :
-                        setattr(module, n, None) # release refs of tied weights if source is going to be quantized
+                        setattr(module, n, None) # release refs to tied weights if source is going to be quantized
                     # otherwise don't force load as it will be loaded in the source anyway
                 else:
                     _force_load_parameter(p)
@@ -1639,13 +1641,20 @@ class offload:
         self.blocks_of_modules = {}
         self.blocks_of_modules_sizes = {}
         self.anyCompiledModule = False
+        self.device_mem_capacity = 0
+        self.last_reserved_mem_check = 0
+        self.default_stream = None
+        self.transfer_stream = None
+        self.parameters_ref = {}
+        self.cotenants_map = {}
         if torch.cuda.is_available():
             self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
             self.last_reserved_mem_check = time.time()
-            self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
+            self.default_stream = torch.cuda.default_stream(torch.device("cuda"))
             self.transfer_stream = torch.cuda.Stream()
         else:
-            self.device_mem_capacity = 0
+            import psutil
+            self.device_mem_capacity = psutil.virtual_memory().total
             self.last_reserved_mem_check = 0
             self.default_stream = None
             self.transfer_stream = None
@@ -1742,8 +1751,10 @@ class offload:
             
     @torch.compiler.disable()
     def gpu_load_blocks(self, model_id, blocks_name, preload = False):
-        # cl = clock.start()
-
+        if not torch.cuda.is_available():
+            if self.verboseLevel >= 1:
+                print("CUDA is not available. Skipping gpu_load_blocks.")
+            return
 
         entry_name = model_id if blocks_name is None else model_id + "/" + blocks_name
         
@@ -1830,7 +1841,11 @@ class offload:
 
     @torch.compiler.disable()
     def gpu_unload_blocks(self, model_id, blocks_name):
-        # cl = clock.start()
+        if not torch.cuda.is_available():
+            if self.verboseLevel >= 1:
+                print("CUDA is not available. Skipping gpu_unload_blocks.")
+            return
+
         if blocks_name != None and blocks_name == self.loaded_blocks[model_id]:
             self.loaded_blocks[model_id] = None 
 
@@ -1872,6 +1887,10 @@ class offload:
 
     # @torch.compiler.disable()
     def gpu_load(self, model_id):
+        if not torch.cuda.is_available():
+            if self.verboseLevel >= 1:
+                print("CUDA is not available. Skipping gpu_load.")
+            return
         model = self.models[model_id]
         self.active_models.append(model)
         self.active_models_ids.append(model_id)
@@ -1880,6 +1899,11 @@ class offload:
             self.gpu_load_blocks(model_id, block_name, True)
 
     def unload_all(self):
+        if not torch.cuda.is_available():
+            if self.verboseLevel >= 1:
+                print("CUDA is not available. Skipping unload_all.")
+            return
+
         for model_id in self.active_models_ids:
             self.gpu_unload_blocks(model_id, None)      
             for block_name in self.preloaded_blocks_per_model[model_id]:
@@ -1903,6 +1927,9 @@ class offload:
         self.last_reserved_mem_check = time.time()
 
     def move_args_to_gpu(self, dtype, *args, **kwargs):
+        if not torch.cuda.is_available():
+            return args, kwargs
+
         new_args= []
         new_kwargs={}
 
@@ -1925,6 +1952,8 @@ class offload:
         return new_args, new_kwargs
 
     def ready_to_check_mem(self):
+        if not torch.cuda.is_available():
+            return False
         if self.anyCompiledModule:
              return
         cur_clock = time.time()
@@ -1936,6 +1965,8 @@ class offload:
 
 
     def empty_cache_if_needed(self):
+        if not torch.cuda.is_available():
+            return
         mem_reserved = torch.cuda.memory_reserved()
         mem_threshold = 0.9*self.device_mem_capacity
         if mem_reserved >= mem_threshold:            
@@ -2300,8 +2331,6 @@ class offload:
         torch.cuda.empty_cache()
 
 
-
-
 def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
@@ -2360,8 +2389,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     self.models = models
 
     extraModelsToQuantize =  extraModelsToQuantize if extraModelsToQuantize is not None else []
-    if not isinstance(extraModelsToQuantize, list):
-        extraModelsToQuantize= [extraModelsToQuantize]
     if quantizeTransformer:
         extraModelsToQuantize.append("transformer")            
     models_to_quantize = extraModelsToQuantize
@@ -2579,9 +2606,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             if prev_num < 0:
                 print(f"Size of submodel '{n}': {prev_size/ONE_MB:.1f} MB")
             elif prev_num - start_num <=1:
-                print(f"Size of submodel '{n+ str(start_num)}': {prev_size/ONE_MB:.1f} MB")
+                print(f"Size of submodel '{n+str(start_num)}': {prev_size/ONE_MB:.1f} MB")
             else:
-                print(f"Size of submodel '{n+ str(start_num) +'-'+ str(prev_num)}': {(prev_num-start_num+1)*prev_size/ONE_MB:.1f} MB ({prev_size/ONE_MB:.1f} MB x {prev_num-start_num+1})")
+                print(f"Size of submodel '{n+str(start_num) +'-'+ str(prev_num)}': {(prev_num-start_num+1)*prev_size/ONE_MB:.1f} MB ({prev_size/ONE_MB:.1f} MB x {prev_num-start_num+1})")
 
         for n, size in self.blocks_of_modules_sizes.items():
             size = int(size / 10000)* 10000
@@ -2596,8 +2623,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             print_size_range(prev_pre,start_num,prev_num, prev_size )
 
   
-    torch.set_default_device('cuda')
-    torch.cuda.empty_cache()
+    torch.set_default_device('cuda') if torch.cuda.is_available() else None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()         
 
     return self
