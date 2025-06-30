@@ -1630,32 +1630,31 @@ class HfHook:
 last_offload_obj = None
 class offload:
     def __init__(self):
+        global last_offload_obj
         self.active_models = []
         self.active_models_ids = []
+        self.active_subcaches = {}
         self.models = {}
-        self.cotenants_map = { 
-                            "text_encoder": ["vae", "text_encoder_2"],
-                            "text_encoder_2": ["vae", "text_encoder"],                             
-                        }
         self.verboseLevel = 0
         self.blocks_of_modules = {}
         self.blocks_of_modules_sizes = {}
         self.anyCompiledModule = False
-        self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
-        self.last_reserved_mem_check =0
+        if torch.cuda.is_available():
+            self.device_mem_capacity = torch.cuda.get_device_properties(0).total_memory
+            self.last_reserved_mem_check = time.time()
+            self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
+            self.transfer_stream = torch.cuda.Stream()
+        else:
+            self.device_mem_capacity = 0
+            self.last_reserved_mem_check = 0
+            self.default_stream = None
+            self.transfer_stream = None
         self.loaded_blocks = {}
         self.prev_blocks_names = {}
         self.next_blocks_names = {}
         self.preloaded_blocks_per_model = {}
-        self.default_stream = torch.cuda.default_stream(torch.device("cuda")) # torch.cuda.current_stream()
-        self.transfer_stream = torch.cuda.Stream()
         self.async_transfers = False
-        self.parameters_ref  = {} 
-        self.max_reservable_memory = 0
-
-        global last_offload_obj
         last_offload_obj = self
-
         
     def add_module_to_blocks(self, model_id, blocks_name, submodule, prev_block_name, submodule_name):
 
