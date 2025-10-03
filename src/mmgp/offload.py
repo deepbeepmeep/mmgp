@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.5.12 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -688,7 +688,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.5.12) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1097,7 +1097,9 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
 
             invalid_keys = []
             unexpected_keys = []
-            for k, v in state_dict.items():
+            new_state_dict = {}
+            for k in list(state_dict.keys()):
+                v = state_dict.pop(k)
                 lora_A = lora_B = diff_b = diff = lora_key = None
                 if k.endswith(".diff"):
                     diff = v
@@ -1141,6 +1143,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
+                    v = lora_A = lora_A.to(module.weight.dtype)                     
                 elif lora_B != None:
                     rank = lora_B.shape[1] 
                     if module_shape[0] != v.shape[0]:
@@ -1151,6 +1154,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
+                    v = lora_B = lora_B.to(module.weight.dtype)                     
                 elif diff != None:
                     lora_B = diff
                     if module_shape != v.shape:
@@ -1161,6 +1165,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
+                    v = lora_B = lora_B.to(module.weight.dtype)                     
                 elif diff_b != None:
                     rank = diff_b.shape[0] 
                     if not hasattr(module, "bias"):
@@ -1179,8 +1184,11 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                                 error_msg = append(error_msg, msg) 
                                 fail = True
                             break
+                    v = diff_b = diff_b.to(module.weight.dtype)                     
                 
                 if not check_only:
+                    new_state_dict[k] = v
+                    v = None
                     loras_module_data = loras_model_data.get(module, None)
                     assert loras_module_data != None
                     loras_adapter_data =  loras_module_data.get(adapter_name, None)
@@ -1188,11 +1196,11 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         loras_adapter_data = [None, None, None, 1.]
                         loras_module_data[adapter_name] = loras_adapter_data
                     if lora_A != None:
-                        loras_adapter_data[0] = lora_A.to(module.weight.dtype) 
+                        loras_adapter_data[0] = lora_A
                     elif lora_B != None:
-                        loras_adapter_data[1] = lora_B.to(module.weight.dtype) 
+                        loras_adapter_data[1] = lora_B 
                     else:
-                        loras_adapter_data[2] = diff_b.to(module.weight.dtype) 
+                        loras_adapter_data[2] = diff_b 
                     if rank != None and lora_key is not None and "lora" in lora_key:
                         alpha_key = k[:-len(lora_key)] + "alpha"
                         alpha = lora_alphas.get(alpha_key, None)
@@ -1220,7 +1228,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             if not check_only:
                 # model._loras_tied_weights[adapter_name] = tied_weights
                 if pinnedLora:
-                    pinned_sd_list.append(state_dict)
+                    pinned_sd_list.append(new_state_dict)
                     pinned_names_list.append(path)
                     # _pin_sd_to_memory(state_dict, path)
 
@@ -2287,9 +2295,10 @@ class offload:
         src = f"""
 def {fname}(module, *args, **kwargs):
     _ = __TYPE_CONST  # anchor type as a constant to make code object unique per class
+    nada = "{fname}"
     mgr = module._mm_manager
     mgr._pre_check(module)
-    return module._mm_forward(*args, **kwargs)
+    return module._mm_forward(*args, **kwargs) #{fname}
 """
         ns = {"__TYPE_CONST": mod_cls}
         exec(src, ns)                   # compile a new function object/code object for this class
@@ -2310,7 +2319,8 @@ def {fname}(module, *args, **kwargs):
         wrapper_fn = self._get_wrapper_for_type(type(target_module))
 
         # bind as a bound method (no partial/closures)
-        target_module.forward = types.MethodType(wrapper_fn, target_module)
+        # target_module.forward = types.MethodType(wrapper_fn, target_module)
+        target_module.forward = functools.update_wrapper(functools.partial(wrapper_fn, target_module), previous_method) 
 
     def hook_check_load_into_GPU_if_needed_default(self, target_module, model, model_id, blocks_name, previous_method,  context):
 
@@ -2345,12 +2355,12 @@ def {fname}(module, *args, **kwargs):
         if isinstance(target_module, torch.nn.Linear):
             def check_load_into_GPU_needed_linear(module, *args, **kwargs):
                 check_load_into_GPU_needed()
-                return previous_method(*args, **kwargs) 
+                return previous_method(*args, **kwargs) # linear
             check_load_into_GPU_needed_module = check_load_into_GPU_needed_linear
         else:
             def check_load_into_GPU_needed_other(module, *args, **kwargs):
                 check_load_into_GPU_needed()
-                return previous_method(*args, **kwargs) 
+                return previous_method(*args, **kwargs) # other
             check_load_into_GPU_needed_module = check_load_into_GPU_needed_other
 
         setattr(target_module, "_mm_id", model_id)
@@ -2498,7 +2508,7 @@ def {fname}(module, *args, **kwargs):
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, verboseLevel = -1):
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -2771,8 +2781,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     elif compilationInThisOne and submodule in towers_modules: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
                     else:
-                        if compilationInThisOne and False:
-                            self.hook_check_load_into_GPU_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
+                        if compilationInThisOne: #and False
+                            self.hook_check_load_into_GPU_if_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
                         else:
                             self.hook_check_load_into_GPU_if_needed_default(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
 
@@ -2789,7 +2799,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
 
             for submodel in towers_modules:
-                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode="default" ) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
+                submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode= compile_mode) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
                     #dynamic=True,
 
         self.tune_preloading(model_id, current_budget, towers_names)
