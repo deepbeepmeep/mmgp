@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.1 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.4 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -66,12 +66,10 @@ from accelerate import init_empty_weights
 
 import functools
 import types
-import torch
-
 
 from mmgp import safetensors2
 from mmgp import profile_type
-
+from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format , enable_fp8_fp32_scale_support
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 
 # support for Embedding module quantization that is not supported by default by quanto
@@ -85,6 +83,9 @@ class QEmbedding(QModuleMixin, torch.nn.Embedding):
                     activations=activations, optimizer=optimizer, quantize_input=True)      
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.embedding( input, self.qweight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse )
+
+
+
 
 
 shared_state = {}
@@ -688,7 +689,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.1) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.4) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1049,7 +1050,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
 
         if split_linear_modules_map != None:
             new_state_dict = dict()
-            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False), (".lora_up.weight", -3, True), (".lora_down.weight", -3, False)]
+            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False), (".lora_up.weight", -3, True), (".lora_down.weight", -3, False),(".dora_scale", -2, False),]
             for module_name, module_data in state_dict.items():
                 name_parts = module_name.split(".")
                 for suffix, pos, any_split in suffixes: 
@@ -1089,7 +1090,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
 
             lora_alphas = {}
             for k in keys:
-                if "alpha" in k:
+                if k.endswith(".alpha"):
                     alpha_value = state_dict.pop(k)
                     if torch.is_tensor(alpha_value):
                         alpha_value = float(alpha_value.item())
@@ -1100,13 +1101,16 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             new_state_dict = {}
             for k in list(state_dict.keys()):
                 v = state_dict.pop(k)
-                lora_A = lora_B = diff_b = diff = lora_key = None
+                lora_A = lora_B = diff_b = diff = lora_key = dora_scale = None
                 if k.endswith(".diff"):
                     diff = v
                     module_name = k[ : -5]
                 elif k.endswith(".diff_b"):
                     diff_b = v
                     module_name = k[ : -7]
+                elif k.endswith(".dora_scale"):
+                    dora_scale = v
+                    module_name = k[ : -11]
                 else:
                     pos = k.rfind(".lora_")
                     if pos <=0:
@@ -1185,7 +1189,17 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                                 fail = True
                             break
                     v = diff_b = diff_b.to(module.weight.dtype)                     
-                
+                elif dora_scale != None:
+                    rank = dora_scale.shape[1] 
+                    if module_shape[0] != v.shape[0]:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}': Dora Scale dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, dora scale = {v.shape[0]}). It is likely this Dora has been made for another version of this model."
+                            error_msg = append(error_msg, msg) 
+                            fail = True
+                        break
+                    v = dora_scale = dora_scale.to(module.weight.dtype)                     
                 if not check_only:
                     new_state_dict[k] = v
                     v = None
@@ -1193,19 +1207,23 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                     assert loras_module_data != None
                     loras_adapter_data =  loras_module_data.get(adapter_name, None)
                     if loras_adapter_data == None:
-                        loras_adapter_data = [None, None, None, 1.]
+                        loras_adapter_data = [None, None, None, None, 1.]
+                        module.any_dora = False
                         loras_module_data[adapter_name] = loras_adapter_data
                     if lora_A != None:
                         loras_adapter_data[0] = lora_A
                     elif lora_B != None:
                         loras_adapter_data[1] = lora_B 
+                    elif dora_scale != None:
+                        loras_adapter_data[3] = dora_scale 
+                        loras_module_data["any_dora"] = True
                     else:
                         loras_adapter_data[2] = diff_b 
                     if rank != None and lora_key is not None and "lora" in lora_key:
                         alpha_key = k[:-len(lora_key)] + "alpha"
                         alpha = lora_alphas.get(alpha_key, None)
-                        if alpha is not None: loras_adapter_data[3] = alpha / rank 
-            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = None
+                        if alpha is not None: loras_adapter_data[4] = alpha / rank 
+            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = dora_scale = None
 
             if len(invalid_keys)  > 0:
                 msg = f"Lora '{path}' contains non Lora keys '{trunc(invalid_keys,200)}'"
@@ -1319,7 +1337,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, modules = None,  return_shared_modules = None,  configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1407,13 +1425,13 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
             
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
 
     return model
 
 
 
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, modules = None, return_shared_modules = None, verboseLevel = -1):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -1489,29 +1507,41 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                     state_dict.update(sd)
             else:
                 state_dict, metadata = _safetensors_load_file(file, writable_tensors =writable_tensors)
-                
-            if metadata !=  None:
-                quantization_map = metadata.get("quantization_map", None)
-                config = metadata.get("config", None)
-                if config is not None:
-                    model._config = config
 
-                tied_weights_map = metadata.get("tied_weights_map", None)
-                if tied_weights_map != None:
-                    for name, tied_weights_list in tied_weights_map.items():
-                        mapped_weight = state_dict[name]
-                        for tied_weights in tied_weights_list:
-                            state_dict[tied_weights] = mapped_weight
+        if preprocess_sd != None:
+            state_dict = preprocess_sd(state_dict)
 
-            if quantization_map is None:
-                pos = str.rfind(file, ".")
-                if pos > 0:
-                    quantization_map_path = file[:pos]
-                quantization_map_path += "_map.json"
+        if metadata !=  None:
+            quantization_map = metadata.get("quantization_map", None)
+            config = metadata.get("config", None)
+            if config is not None:
+                model._config = config
 
-                if os.path.isfile(quantization_map_path):
-                    with open(quantization_map_path, 'r') as f:
-                        quantization_map = json.load(f)
+            tied_weights_map = metadata.get("tied_weights_map", None)
+            if tied_weights_map != None:
+                for name, tied_weights_list in tied_weights_map.items():
+                    mapped_weight = state_dict[name]
+                    for tied_weights in tied_weights_list:
+                        state_dict[tied_weights] = mapped_weight
+
+        if quantization_map is None:
+            detection_type = detect_safetensors_format(state_dict)
+            if detection_type["kind"] in ['scaled_fp8','fp8']:
+                conv_result = convert_scaled_fp8_to_quanto(state_dict, dtype = default_dtype, in_place= True)
+                state_dict = conv_result["state_dict"]
+                quantization_map = conv_result["quant_map"]
+                conv_result = None
+                # enable_fp8_fp32_scale_support()
+
+        if quantization_map is None:
+            pos = str.rfind(file, ".")
+            if pos > 0:
+                quantization_map_path = file[:pos]
+            quantization_map_path += "_map.json"
+
+            if os.path.isfile(quantization_map_path):
+                with open(quantization_map_path, 'r') as f:
+                    quantization_map = json.load(f)
         
         full_state_dict.update(state_dict)
         if quantization_map != None:
@@ -1530,8 +1560,8 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     full_state_dict, full_quantization_map, full_tied_weights_map = None, None, None
 
     # deal if we are trying to load just a sub part of a larger model
-    if preprocess_sd != None:
-        state_dict, quantization_map = preprocess_sd(state_dict, quantization_map)
+    if postprocess_sd != None:
+        state_dict, quantization_map = postprocess_sd(state_dict, quantization_map)
         
     if modelPrefix != None:
         base_model_prefix = modelPrefix + "."
@@ -1562,7 +1592,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         
     del state_dict
 
-    if len(unexpected_keys) > 0 and verboseLevel >=2:
+    if len(unexpected_keys) > 0 and verboseLevel >=2 and not ignore_unused_weights:
         print(f"Unexpected keys while loading '{file_path}': {unexpected_keys}")
 
     for k,p in model.named_parameters():
@@ -2118,7 +2148,7 @@ class offload:
             data = loras_data.get(active_adapter + '_GPU', None)
             if data == None:
                 continue
-            diff_w , _ , diff_b, alpha = data
+            diff_w , _ , diff_b, _, alpha = data
             scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
             if scaling == 0:
                 continue
@@ -2144,15 +2174,116 @@ class offload:
         return ret
 
 
+    def _dora_linear_forward(
+        self,
+        model,
+        submodule,
+        adapters_data,                # dict: name+"_GPU" -> (A, B, diff_b, g_abs, alpha); g_abs=None means LoRA
+        weight= None,
+        bias = None,
+        original_bias = True,
+        dora_mode: str = "blend",     # "ref_exact" | "blend"
+    ):
+        active_adapters = getattr(model, "_loras_active_adapters", [])
+        loras_scaling   = getattr(model, "_loras_scaling", {})
+        # Snapshot base weight (safe for quantized modules)
+        if weight is None:
+            bias = submodule.bias
+            original_bias = True
+            if isinstance(submodule, QModuleMixin):
+                weight = submodule.weight.view(submodule.weight.shape)
+            else:
+                weight = submodule.weight.clone()
+
+        base_dtype = weight.dtype
+        eps = 1e-8
+        W0 = weight.float()
+        g0 = torch.linalg.vector_norm(W0, dim=1, keepdim=True, dtype=torch.float32).clamp_min(eps)  # [out,1]
+
+        # Keep big mats in low precision
+        # Wc = W0 if W0.dtype == compute_dtype else W0.to(compute_dtype)
+        W0 /= g0
+        weight[...]  = W0.to(base_dtype) 
+        W0 = None
+
+        dir_update = None          # Σ s * ((B@A)/g0)  in compute_dtype
+        g = None                   # final magnitude: set absolute (ref_exact) or blended (blend)
+        bias_delta = None          # Σ s * diff_b
+
+        # Accumulate DoRA adapters only (g_abs != None)
+        for name in active_adapters:
+            data = adapters_data.get(name + "_GPU", None)
+            if data is None: continue
+            A, B, diff_b, g_abs, alpha = data
+            if g_abs is None: continue  
+
+            s = self._get_lora_scaling(loras_scaling, model, name) * float(alpha)
+            if s == 0: continue
+
+            # Direction update in V-space with row-wise 1/g0
+            if (A is not None) and (B is not None):
+                dV = torch.mm(B, A)      # [out,in], compute_dtype
+                dV /= g0               # row-wise divide
+                dV.mul_(s)
+                dir_update = dV if dir_update is None else dir_update.add_(dV)
+
+
+            if dora_mode == "ref_exact":
+                # absolute magnitude (last one wins if multiple DoRAs present)
+                g = g_abs
+            elif dora_mode == "blend":
+                # blend towards absolute magnitude proportional to s
+                if g is None:
+                    g = g0.clone()
+                g.add_(g_abs.sub(g0), alpha=s)
+            else:
+                raise ValueError(f"Unknown dora_mode: {dora_mode}")
+
+            # Optional bias deltas (not in reference, but harmless if present)
+            if diff_b is not None:
+                db = diff_b.mul(s)
+                bias_delta = db if bias_delta is None else bias_delta.add_(db)
+                db = None
+
+        if g is None:
+            g = g0  # no magnitude provided -> keep original
+
+        # Re-normalize rows if we changed direction
+        if dir_update is not None:
+            weight.add_(dir_update)
+            V = weight.float()
+            Vn = torch.linalg.vector_norm(V, dim=1, keepdim=True, dtype=torch.float32).clamp_min(eps)
+            V /= Vn
+            V *= g
+            weight[...] = V.to(base_dtype)
+            V = None
+        else:
+            weight *= g
+        # Recompose adapted weight; cast back to module dtype
+
+        # Merge DoRA bias delta safely
+        if bias_delta is not None:
+            if bias is None:
+                bias = bias_delta 
+            else:
+                bias = bias.clone() if original_bias else bias
+                bias.add_(bias_delta)
+
+        return weight, bias
+
+
+
     def _lora_linear_forward(self, model, submodule, loras_data, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         weight = submodule.weight
+        bias = submodule.bias
         active_adapters = model._loras_active_adapters
         loras_scaling = model._loras_scaling
+        any_dora = loras_data.get("any_dora", False)
         training = False
 
         dtype = weight.dtype 
-        if weight.shape[-1] < x.shape[-2]: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
-            bias = submodule.bias
+        if weight.shape[-1] < x.shape[-2] or any_dora: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+            original_bias = True
             original_bias = True
             if len(active_adapters) > 0:
                 if isinstance(submodule, QModuleMixin): 
@@ -2163,9 +2294,9 @@ class offload:
                     data = loras_data.get(active_adapter + '_GPU', None)
                     if data == None:
                         continue                    
-                    lora_A_weight, lora_B_weight, diff_b, alpha = data
+                    lora_A_weight, lora_B_weight, diff_b, g_abs, alpha = data
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
-                    if scaling == 0:
+                    if scaling == 0 or g_abs is not None:
                         continue
                     if lora_A_weight != None:
                         weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
@@ -2179,6 +2310,10 @@ class offload:
                             original_bias = False
                         bias.add_(diff_b, alpha=scaling)
                     # base_weight += scaling * lora_B_weight @ lora_A_weight
+
+                if any_dora :
+                    weight, bias = self._dora_linear_forward(model, submodule, loras_data, weight, bias, original_bias)
+
             if training:
                 pass
                 # result = torch.nn.functional.linear(dropout(x), base_weight, bias=submodule.bias)
@@ -2186,7 +2321,7 @@ class offload:
                 result = torch.nn.functional.linear(x, weight, bias=bias)
 
         else:
-            result = torch.nn.functional.linear(x, weight, bias=submodule.bias)
+            result = torch.nn.functional.linear(x, weight, bias=bias)
 
             if len(active_adapters) > 0:
                 x = x.to(dtype)
@@ -2195,10 +2330,10 @@ class offload:
                     data = loras_data.get(active_adapter + '_GPU', None)
                     if data == None:
                         continue
-                    lora_A, lora_B, diff_b, alpha = data
+                    lora_A, lora_B, diff_b, g_abs, alpha = data
                     # dropout = self.lora_dropout[active_adapter]
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
-                    if scaling == 0:
+                    if scaling == 0 or g_abs is not None:
                         continue
 
                     if lora_A == None:
