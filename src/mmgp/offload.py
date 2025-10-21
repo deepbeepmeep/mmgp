@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.4 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.6 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -63,7 +63,7 @@ import json
 import psutil
 import builtins
 from accelerate import init_empty_weights
-
+from functools import wraps
 import functools
 import types
 
@@ -86,6 +86,14 @@ class QEmbedding(QModuleMixin, torch.nn.Embedding):
 
 
 
+def cudacontext(device):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with torch.device(device):
+                return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 
 shared_state = {}
@@ -689,7 +697,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.4) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.6) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1294,6 +1302,7 @@ def sync_models_loras(model, model2):
 
 def unload_loras_from_model(model):
     if model is None: return
+    if not hasattr(model, "_loras_model_data"): return
     for _, v in model._loras_model_data.items():
         v.clear()
     for _, v in model._loras_model_shortcuts.items():
@@ -1420,7 +1429,6 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
             model = transfomer_class.from_config(transformer_config )
 
 
-    torch.set_default_device('cpu')
     model.eval().requires_grad_(False)
 
     model._config = transformer_config
@@ -1431,6 +1439,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
 
 
+@cudacontext("cpu")
 def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
@@ -1486,6 +1495,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     for no, file in enumerate(file_path):
         quantization_map = None
         tied_weights_map = None
+        metadata = None
         if not (".safetensors" in file or ".sft" in file): 
             if pinToMemory:
                 raise Exception("Pinning to memory while loading only supported for safe tensors files")
@@ -1497,7 +1507,6 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             basename = os.path.basename(file)
 
             if "-of-" in basename:
-                metadata = None
                 file_parts= basename.split("-")
                 parts_max = int(file_parts[-1][:5])
                 state_dict = {}
