@@ -371,6 +371,7 @@ def detect_safetensors_format(
 
 # ---------- Optional Quanto runtime patch (FP32-scale support), enable/disable ----------
 _patch_state = SimpleNamespace(enabled=False, orig=None, scale_index=None)
+_fp8_kernel_patch_state = SimpleNamespace(enabled=False, orig_forward=None)
 
 def enable_fp8_fp32_scale_support():
     """
@@ -444,6 +445,68 @@ def disable_fp8_fp32_scale_support():
     _patch_state.orig = None
     _patch_state.scale_index = None
     return True
+
+
+def _quant_map_has_fp8(quant_map) -> bool:
+    if not quant_map:
+        return False
+    for cfg in quant_map.values():
+        if not isinstance(cfg, dict):
+            continue
+        weights = cfg.get("weights")
+        if isinstance(weights, str) and "qfloat8" in weights.lower():
+            return True
+    return False
+
+
+def enable_fp8_marlin_fallback():
+    """
+    Replace Quanto's Marlin FP8 linear kernel with a plain matmul fallback.
+
+    When enabled, FP8 weights are dequantized on-the-fly and multiplied with
+    standard PyTorch ops, side-stepping quanto's custom CUDA kernels.
+    """
+    if _fp8_kernel_patch_state.enabled:
+        return True
+    try:
+        from optimum.quanto.tensor.function import QuantizedLinearFunction as _QLF
+        from optimum.quanto.tensor.weights.marlin.fp8 import qbits as marlin_fp8
+    except Exception:
+        return False
+
+    orig_forward = marlin_fp8.MarlinF8QBytesLinearFunction.forward
+
+    def fallback_forward(ctx, input, other, bias=None):
+        weight = other.dequantize()
+        if weight.dtype != input.dtype:
+            weight = weight.to(input.dtype)
+        weight = weight.contiguous()
+        return _QLF.forward(ctx, input, weight, bias)
+
+    marlin_fp8.MarlinF8QBytesLinearFunction.forward = staticmethod(fallback_forward)
+    _fp8_kernel_patch_state.enabled = True
+    _fp8_kernel_patch_state.orig_forward = orig_forward
+    return True
+
+
+def disable_fp8_marlin_fallback():
+    """Restore Quanto's original Marlin FP8 kernel."""
+    if not _fp8_kernel_patch_state.enabled:
+        return False
+    from optimum.quanto.tensor.weights.marlin.fp8 import qbits as marlin_fp8
+    marlin_fp8.MarlinF8QBytesLinearFunction.forward = staticmethod(_fp8_kernel_patch_state.orig_forward)
+    _fp8_kernel_patch_state.enabled = False
+    _fp8_kernel_patch_state.orig_forward = None
+    return True
+
+
+def maybe_enable_fp8_marlin_fallback(quantization_map=None):
+    """
+    Enable the FP8 fallback only when the provided quantization map contains FP8 weights.
+    """
+    if quantization_map is not None and not _quant_map_has_fp8(quantization_map):
+        return False
+    return enable_fp8_marlin_fallback()
 
 # ---------- Tiny CLI (optional) ----------
 def _cli():

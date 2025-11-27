@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.7 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.9 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -69,7 +69,7 @@ import types
 
 from mmgp import safetensors2
 from mmgp import profile_type
-from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format , enable_fp8_fp32_scale_support
+from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 
 # support for Embedding module quantization that is not supported by default by quanto
@@ -697,7 +697,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.7) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.9) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -976,7 +976,7 @@ def split_linear_modules(model, map ):
                     _scale = weight._scale
                     sub_data = torch.split(_data, split_sizes, dim=0)
                     sub_scale = torch.split(_scale, split_sizes, dim=0)
-                    sub_bias = torch.split(bias, split_sizes, dim=0)
+                    sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
                     for sub_name, _subdata, _subbias, _subscale in zip(mapped_modules, sub_data, sub_bias, sub_scale):
                         with init_empty_weights():
                             sub_module = QLinear(_subdata.shape[1], _subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
@@ -989,7 +989,7 @@ def split_linear_modules(model, map ):
                     # del _data, _scale, _subdata, sub_d                
                 else:
                     sub_data = torch.split(weight, split_sizes, dim=0)
-                    sub_bias = torch.split(bias, split_sizes, dim=0)
+                    sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
                     for sub_name, subdata, subbias in zip(mapped_modules, sub_data, sub_bias):
                         with init_empty_weights():
                             sub_module = torch.nn.Linear( subdata.shape[1], subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
