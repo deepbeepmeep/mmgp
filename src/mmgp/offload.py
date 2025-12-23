@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.9 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.10 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -697,7 +697,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.9) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.10) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -834,6 +834,7 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
 
     cache_ref = {}
     tied_weights= {}
+    reversed_tied_weights= {}
 
     for submodule_name, submodule in model_to_quantize.named_modules():  
         if isinstance(submodule, QModuleMixin):
@@ -846,7 +847,9 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
             ref = _get_tensor_ref(p)
             match = cache_ref.get(ref, None)
             if match != None:
-                tied_weights[submodule_name]=  (n, ) + match 
+                tied_weights[submodule_name]=  (n, ) + match
+                entries = reversed_tied_weights.get( match, [])
+                reversed_tied_weights[match] = entries + [ (p, submodule_name,n)]
             else:
                 cache_ref[ref] = (submodule_name, n)
                 size  += torch.numel(p.data) * sizeofhalffloat
@@ -914,6 +917,7 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
     # force to read non quantized parameters so that their lazy tensors and corresponding mmap are released
     # otherwise we may end up keeping in memory both the quantized and the non quantize model
     named_modules = {n:m for n,m in model_to_quantize.named_modules()}
+
     for module_name, module in named_modules.items():
         # do not read quantized weights (detected them directly or behind an adapter)
         if isinstance(module, QModuleMixin) or hasattr(module, "base_layer") and  isinstance(module.base_layer, QModuleMixin): 
@@ -922,12 +926,18 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
         else:
             tied_w = tied_weights.get(module_name, None)
             for n, p in module.named_parameters(recurse = False):
+
                 if tied_w != None and n == tied_w[0]:
                     if isinstance( named_modules[tied_w[1]], QModuleMixin) :
                         setattr(module, n, None) # release refs of tied weights if source is going to be quantized
                     # otherwise don't force load as it will be loaded in the source anyway
                 else:
                     _force_load_parameter(p)
+                    entries =  reversed_tied_weights.get( (module_name, n), [])
+                    for tied_weight, tied_module_name, tied_weight_name in entries:
+                        if n == tied_weight_name:
+                             tied_weight.data = p.data
+
                 del p #  del p if not it will still contain a ref to a tensor when leaving the loop
         for b in module.buffers(recurse = False):
             _force_load_buffer(b) 
@@ -1146,7 +1156,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         if ignore_model_variations:
                             skip = True
                         else:
-                            msg = f"Lora '{path}': Lora A dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[1]}, lora A = {v.shape[1]}). It is likely this Lora has been made for another version of this model."
+                            msg = f"Lora '{path}/{module_name}': Lora A dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[1]}, lora A = {v.shape[1]}). It is likely this Lora has been made for another version of this model."
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
@@ -1157,7 +1167,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         if ignore_model_variations:
                             skip = True
                         else:
-                            msg = f"Lora '{path}': Lora B dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora B = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
+                            msg = f"Lora '{path}/{module_name}': Lora B dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora B = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
@@ -1168,7 +1178,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                         if ignore_model_variations:
                             skip = True
                         else:
-                            msg = f"Lora '{path}': Lora shape is not compatible with model '{_get_module_name(model)}' (model = {module_shape[0]}, lora = {v.shape[0]}). It is likely this Lora has been made for another version of this model."
+                            msg = f"Lora '{path}/{module_name}': Lora shape is not compatible with model '{_get_module_name(model)}' (model = {module_shape}, lora = {v.shape}). It is likely this Lora has been made for another version of this model."
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
@@ -1427,7 +1437,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
     model.eval().requires_grad_(False)
 
     model._config = transformer_config
-            
+
     load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
 
     return model
@@ -1494,7 +1504,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         if not (".safetensors" in file or ".sft" in file): 
             if pinToMemory:
                 raise Exception("Pinning to memory while loading only supported for safe tensors files")
-            state_dict = torch.load(file, weights_only=True, map_location="cpu")
+            state_dict = torch.load(file, weights_only=False, map_location="cpu")
             if "module" in state_dict:
                 state_dict = state_dict["module"]
             
