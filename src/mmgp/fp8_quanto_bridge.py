@@ -272,6 +272,24 @@ def convert_scaled_fp8_to_quanto(
     finally:
         closer()
 
+
+def detect(state_dict, verboseLevel=1):
+    info = detect_safetensors_format(state_dict)
+    kind = info.get("kind", "none")
+    matched = kind in ("scaled_fp8", "fp8")
+    return {"matched": matched, "kind": "fp8" if matched else "none", "details": info}
+
+
+def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None):
+    if detection is not None and not detection.get("matched", False):
+        return {"state_dict": state_dict, "quant_map": {}}
+    conv_result = convert_scaled_fp8_to_quanto(state_dict, dtype=default_dtype, in_place=True)
+    return {"state_dict": conv_result["state_dict"], "quant_map": conv_result["quant_map"]}
+
+
+def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
+    return quantization_map, []
+
 def detect_safetensors_format(
     src: Union[str, Dict[str, torch.Tensor]],
     *,

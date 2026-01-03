@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: mmgp
-Version: 3.6.9
+Version: 3.6.10
 Summary: Memory Management for the GPU Poor
 Author-email: deepbeepmeep <deepbeepmeep@yahoo.com>
 Requires-Python: >=3.10
@@ -15,7 +15,7 @@ Dynamic: license-file
 
 
 <p align="center">
-  <H2>Memory Management 3.6.9 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 3.6.10 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 

@@ -4,8 +4,8 @@ pyproject.toml
 src/__init__.py
 src/mmgp/__init__.py
 src/mmgp/fp8_quanto_bridge.py
-src/mmgp/fp8_quanto_bridge_old.py
 src/mmgp/offload.py
+src/mmgp/quant_router.py
 src/mmgp/safetensors2.py
 src/mmgp.egg-info/PKG-INFO
 src/mmgp.egg-info/SOURCES.txt

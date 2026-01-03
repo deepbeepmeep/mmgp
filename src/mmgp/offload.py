@@ -60,6 +60,7 @@ import functools
 import sys
 import os
 import json
+import inspect
 import psutil
 import builtins
 from accelerate import init_empty_weights
@@ -69,7 +70,7 @@ import types
 
 from mmgp import safetensors2
 from mmgp import profile_type
-from .fp8_quanto_bridge import convert_scaled_fp8_to_quanto, detect_safetensors_format
+from .quant_router import detect_safetensors_format, detect_and_convert, apply_pre_quantization
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 
 # support for Embedding module quantization that is not supported by default by quanto
@@ -113,6 +114,149 @@ def clear_caches():
     all_cache = shared_state.get("_cache",  None)
     if all_cache is not None:
         all_cache.clear()
+
+
+def get_available_qtypes():
+    try:
+        from optimum.quanto.tensor.qtype import qtypes as _quanto_qtypes
+    except Exception:
+        return []
+    return sorted(_quanto_qtypes.keys())
+
+
+def get_available_qtype_aliases():
+    aliases = set()
+    for name in get_available_qtypes():
+        key = str(name).lower()
+        aliases.add(key)
+        if key.startswith("q") and len(key) > 1:
+            aliases.add(key[1:])
+        if "float8" in key:
+            aliases.add("fp8")
+    return aliases
+
+
+def get_quantization_tokens(quantization):
+    if quantization is None:
+        return []
+    key = str(quantization).lower()
+    if len(key) == 0:
+        return []
+    aliases = get_available_qtype_aliases()
+    if key not in aliases:
+        return []
+    tokens = {key}
+    if key.startswith("q") and len(key) > 1:
+        tokens.add(key[1:])
+    if "float8" in key or key == "fp8":
+        tokens.add("fp8")
+    if "int4" in key:
+        tokens.add("int4")
+    if "int8" in key:
+        tokens.add("int8")
+    return sorted(tokens, key=len, reverse=True)
+
+
+def get_quantization_label(quantization):
+    if quantization is None:
+        return ""
+    key = str(quantization).lower()
+    if key in ("", "none", "bf16", "fp16", "float16", "bfloat16"):
+        return ""
+    aliases = get_available_qtype_aliases()
+    if key not in aliases:
+        return ""
+    if "float8" in key or key == "fp8":
+        return "FP8"
+    if key.startswith("q"):
+        key = key[1:]
+    return key.replace("_", " ").upper()
+
+
+_quantization_filename_cache = {}
+
+
+def _normalize_quant_file_key(file_path):
+    try:
+        return os.path.normcase(os.path.abspath(file_path))
+    except Exception:
+        return str(file_path).lower()
+
+
+def get_cached_quantization_for_file(file_path):
+    if not file_path:
+        return None
+    return _quantization_filename_cache.get(_normalize_quant_file_key(file_path))
+
+
+def cache_quantization_for_file(file_path, kind):
+    if not file_path or not kind:
+        return
+    key = _normalize_quant_file_key(file_path)
+    if key not in _quantization_filename_cache:
+        _quantization_filename_cache[key] = kind
+
+
+def _infer_qtype_from_quantization_map(quantization_map):
+    if not quantization_map:
+        return None
+    counts = {}
+    for entry in quantization_map.values():
+        if not isinstance(entry, dict):
+            continue
+        weights = entry.get("weights")
+        if not weights or weights == "none":
+            continue
+        counts[weights] = counts.get(weights, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def detect_quantization_kind_for_file(file_path, verboseLevel=1):
+    cached = get_cached_quantization_for_file(file_path)
+    if cached:
+        return cached
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    if not (".safetensors" in file_path or ".sft" in file_path):
+        return None
+    try:
+        state_dict, metadata = _safetensors_load_file(file_path, writable_tensors=False)
+    except Exception:
+        return None
+    kind = None
+    try:
+        info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel)
+        kind = info.get("kind")
+    except Exception:
+        kind = None
+    if (not kind or kind == "none") and metadata is not None:
+        inferred = _infer_qtype_from_quantization_map(metadata.get("quantization_map"))
+        if inferred:
+            kind = inferred
+    cache_quantization_for_file(file_path, kind or "none")
+    return kind
+
+
+def detect_quantization_label_from_filename(filename):
+    if not filename:
+        return ""
+    cached = get_cached_quantization_for_file(filename)
+    if cached:
+        return get_quantization_label(cached)
+    kind = detect_quantization_kind_for_file(filename, verboseLevel=0)
+    if kind:
+        label = get_quantization_label(kind)
+        if label:
+            return label
+    base = os.path.basename(filename).lower()
+    for token in sorted(get_available_qtype_aliases(), key=len, reverse=True):
+        if token and token in base:
+            return get_quantization_label(token)
+    if "quanto" in base:
+        return "QUANTO"
+    return ""
 
 
 mmm = safetensors2.mmm
@@ -307,23 +451,112 @@ def _safetensors_load_file(file_path, writable_tensors = True):
 
 def _force_load_buffer(p):
     # To do : check if buffer was persistent and transfer state, or maybe swap keep already this property ?
-    q = torch.nn.Buffer(p + 0)
+    q = torch.nn.Buffer(p.clone())
     torch.utils.swap_tensors(p, q)
     del q
 
 def _force_load_parameter(p):
-    q = torch.nn.Parameter(p + 0)
+    q = torch.nn.Parameter(p.clone())
     torch.utils.swap_tensors(p, q)
     del q
 
-def _get_tensor_ref(p):
-    if isinstance(p, QTensor):
-        if p._qtype == qint4:
-            return p._data._data.data_ptr()
+def _unwrap_quantized_tensor(tensor):
+    if hasattr(tensor, "_data") and torch.is_tensor(tensor._data):
+        return tensor._data
+    return tensor
+
+def _qtensor_get_quantized_subtensors(self):
+    subtensors = []
+    if getattr(self, "_qtype", None) == qint4:
+        data = _unwrap_quantized_tensor(self._data)
+        subtensors.append(("data", data))
+        if hasattr(self, "_scale_shift") and self._scale_shift is not None:
+            subtensors.append(("scale_shift", self._scale_shift))
         else:
-            return p._data.data_ptr()
-    else:                
-        return p.data_ptr()
+            if hasattr(self, "_scale") and self._scale is not None:
+                subtensors.append(("scale", self._scale))
+            if hasattr(self, "_shift") and self._shift is not None:
+                subtensors.append(("shift", self._shift))
+        return subtensors
+
+    if hasattr(self, "_data"):
+        data = _unwrap_quantized_tensor(self._data)
+        subtensors.append(("data", data))
+    if hasattr(self, "_scale") and self._scale is not None:
+        subtensors.append(("scale", self._scale))
+    return subtensors
+
+def _qtensor_set_quantized_subtensors(self, sub_tensors):
+    if isinstance(sub_tensors, dict):
+        sub_map = sub_tensors
+    else:
+        sub_map = {name: tensor for name, tensor in sub_tensors}
+
+    data = sub_map.get("data", None)
+    if data is not None:
+        if hasattr(self, "_data") and hasattr(self._data, "_data") and torch.is_tensor(self._data._data):
+            self._data._data = data
+        else:
+            self._data = data
+
+    if getattr(self, "_qtype", None) == qint4:
+        if "scale_shift" in sub_map and sub_map["scale_shift"] is not None:
+            self._scale_shift = sub_map["scale_shift"]
+        else:
+            if "scale" in sub_map and sub_map["scale"] is not None:
+                self._scale = sub_map["scale"]
+            if "shift" in sub_map and sub_map["shift"] is not None:
+                self._shift = sub_map["shift"]
+    else:
+        if "scale" in sub_map and sub_map["scale"] is not None:
+            self._scale = sub_map["scale"]
+
+if not hasattr(QTensor, "get_quantized_subtensors"):
+    QTensor.get_quantized_subtensors = _qtensor_get_quantized_subtensors
+if not hasattr(QTensor, "set_quantized_subtensors"):
+    QTensor.set_quantized_subtensors = _qtensor_set_quantized_subtensors
+
+def _get_quantized_subtensors(p):
+    getter = getattr(p, "get_quantized_subtensors", None)
+    if getter is None:
+        return None
+    sub_tensors = getter()
+    if not sub_tensors:
+        return None
+    if isinstance(sub_tensors, dict):
+        sub_tensors = list(sub_tensors.items())
+    out = []
+    for name, tensor in sub_tensors:
+        if tensor is None:
+            continue
+        if torch.is_tensor(tensor):
+            out.append((name, tensor))
+    return out if out else None
+
+def _set_quantized_subtensors(p, sub_tensors):
+    setter = getattr(p, "set_quantized_subtensors", None)
+    if setter is None:
+        return False
+    setter(sub_tensors)
+    return True
+
+def _subtensors_nbytes(sub_tensors):
+    return sum(torch.numel(t) * t.element_size() for _, t in sub_tensors)
+
+def _subtensors_itemsize(sub_tensors, fallback):
+    for _, t in sub_tensors:
+        return t.element_size()
+    return fallback
+
+def _get_tensor_ref(p):
+    sub_tensors = _get_quantized_subtensors(p)
+    if sub_tensors:
+        for _, t in sub_tensors:
+            ref = t.data_ptr()
+            del sub_tensors
+            return ref
+        del sub_tensors
+    return p.data_ptr()
 
 
 BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
@@ -546,25 +779,18 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                 tied_weights_last = f"{match_name} <-> {n}"
             tied_weights[n] = match_name
         else:
-            if isinstance(p, QTensor):
-                if p._qtype == qint4:
-                    if p._data._data.is_pinned():
-                        params_dict[n] = (None, False)
-                        continue
-                    if hasattr(p,"_scale_shift"):
-                        length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale_shift) * p._scale_shift.element_size() 
-                    else:
-                        length = torch.numel(p._data._data) * p._data._data.element_size() + torch.numel(p._scale) * p._scale.element_size() + torch.numel(p._shift) * p._shift.element_size()                     
-                else:
-                    length = torch.numel(p._data) * p._data.element_size() + torch.numel(p._scale) * p._scale.element_size() 
-                    if p._data.is_pinned():
-                        params_dict[n] = (None, False)
-                        continue
+            sub_tensors = _get_quantized_subtensors(p)
+            if sub_tensors:
+                if builtins.all(t.is_pinned() for _, t in sub_tensors):
+                    params_dict[n] = (None, False)
+                    del sub_tensors
+                    continue
+                length = _subtensors_nbytes(sub_tensors)
             else:
                 if p.data.is_pinned():
                     params_dict[n] = (None, False)
                     continue
-                length = torch.numel(p.data) * p.data.element_size() 
+                length = torch.numel(p.data) * p.data.element_size()
 
             ref_cache[ref] = (n, length)
             if current_big_tensor_size + length > big_tensor_size and current_big_tensor_size !=0  :
@@ -572,8 +798,11 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                 current_big_tensor_size = 0
                 big_tensor_no += 1
 
-
-            itemsize = p.data.dtype.itemsize
+            if sub_tensors:
+                itemsize = _subtensors_itemsize(sub_tensors, p.data.dtype.itemsize)
+                del sub_tensors
+            else:
+                itemsize = p.data.dtype.itemsize
             if current_big_tensor_size % itemsize:
                 current_big_tensor_size += itemsize - current_big_tensor_size % itemsize
             tensor_map_indexes.append((big_tensor_no, current_big_tensor_size, length  ))
@@ -610,15 +839,11 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
         q_name = tied_weights.get(n,None)
         if q_name != None:
             q , _ = params_dict[q_name] 
-            if isinstance(p, QTensor):
-                if p._qtype == qint4:                
-                    p._data._data = q._data._data
-                    p._scale_shift = q._scale_shift
-                    assert p._data._data.data.is_pinned()
-                else:
-                    p._data = q._data
-                    p._scale = q._scale
-                    assert p._data.is_pinned()
+            sub_tensors = _get_quantized_subtensors(q)
+            if sub_tensors:
+                sub_map = {name: tensor for name, tensor in sub_tensors}
+                _set_quantized_subtensors(p, sub_map)
+                del sub_map, sub_tensors
             else:
                 p.data = q.data
                 assert p.data.is_pinned()
@@ -651,25 +876,18 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
             if is_buffer :
                 _force_load_buffer(p) # otherwise potential memory leak
-            if isinstance(p, QTensor):
-                if p._qtype == qint4:
-                    length1 = torch.numel(p._data._data) * p._data._data.element_size()
-                    p._data._data =  _move_to_pinned_tensor(p._data._data, current_big_tensor, offset, length1)
-                    if hasattr(p,"_scale_shift"):
-                        length2 = torch.numel(p._scale_shift) * p._scale_shift.element_size() 
-                        p._scale_shift = _move_to_pinned_tensor(p._scale_shift, current_big_tensor, offset + length1, length2)
-                    else:
-                        length2 = torch.numel(p._scale) * p._scale.element_size() 
-                        p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
-                        length3 = torch.numel(p._shift) * p._shift.element_size() 
-                        p._shift = _move_to_pinned_tensor(p._shift, current_big_tensor, offset + length1 + length2, length3)
-                else:
-                    length1 = torch.numel(p._data) * p._data.element_size() 
-                    p._data = _move_to_pinned_tensor(p._data, current_big_tensor, offset, length1)
-                    length2 = torch.numel(p._scale) * p._scale.element_size() 
-                    p._scale = _move_to_pinned_tensor(p._scale, current_big_tensor, offset + length1, length2)
+            sub_tensors = _get_quantized_subtensors(p)
+            if sub_tensors:
+                sub_offset = offset
+                new_subs = {}
+                for name, tensor in sub_tensors:
+                    length = torch.numel(tensor) * tensor.element_size()
+                    new_subs[name] = _move_to_pinned_tensor(tensor, current_big_tensor, sub_offset, length)
+                    sub_offset += length
+                _set_quantized_subtensors(p, new_subs)
+                del new_subs, sub_tensors
             else:
-                length = torch.numel(p.data) * p.data.element_size() 
+                length = torch.numel(p.data) * p.data.element_size()
                 p.data = _move_to_pinned_tensor(p.data, current_big_tensor, offset, length)
 
             tensor_no += 1
@@ -782,7 +1000,7 @@ def _quantize_submodule(
             setattr(module, name, None)
             del param
 
-def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict):
+def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict, default_dtype=None):
     # change dtype of current meta model parameters because 'requantize' won't update the dtype on non quantized parameters
     for k, p in model.named_parameters():
         if not k in quantization_map and k in state_dict:
@@ -801,6 +1019,11 @@ def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict
             if activations == "none":
                 activations = None
             _quantize_submodule(model, name, m, weights=weights, activations=activations)
+            if default_dtype is not None:
+                new_module = model.get_submodule(name)
+                setter = getattr(new_module, "set_default_dtype", None)
+                if callable(setter):
+                    setter(default_dtype)
 
     model._quanto_map = quantization_map
 
@@ -968,35 +1191,337 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
 
     return True
 
-def split_linear_modules(model, map ):
-    from optimum.quanto import QModuleMixin, WeightQBytesTensor, QLinear
+def _as_field_tuple(value):
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
+def _get_split_handler(info, field, default_handlers):
+    handlers = info.get("split_handlers") or info.get("field_handlers") or {}
+    if handlers:
+        handler = handlers.get(field)
+        if handler is not None:
+            return handler
+    if default_handlers:
+        return default_handlers.get(field)
+    return None
+
+
+def _get_split_base_fields(info, split_fields):
+    base_fields = _as_field_tuple(info.get("base_fields") or info.get("base_field"))
+    if base_fields:
+        return base_fields
+    if split_fields:
+        return (next(iter(split_fields.keys())),)
+    return ()
+
+
+def _merge_share_fields(info, share_fields):
+    info_fields = _as_field_tuple(info.get("share_fields") or info.get("shared_fields"))
+    return tuple(sorted(set(info_fields).union(_as_field_tuple(share_fields))))
+
+
+def _call_split_handler(handler, *, src, dim, split_sizes, context):
+    if handler is None:
+        return None
+    try:
+        chunks = handler(src=src, dim=dim, split_sizes=split_sizes, context=context)
+    except Exception:
+        return None
+    if not isinstance(chunks, (list, tuple)) or len(chunks) != len(split_sizes):
+        return None
+    return chunks
+
+
+def _fill_sub_maps(sub_maps, name, value):
+    for sub_map in sub_maps:
+        sub_map[name] = value
+
+
+def sd_split_linear(
+    state_dict,
+    split_map,
+    split_fields=None,
+    share_fields=None,
+    verboseLevel=1,
+    split_handlers=None,
+):
+    if not split_map:
+        return state_dict
+    split_fields = split_fields or {}
+    share_fields = share_fields or ()
+    split_handlers = split_handlers or {}
+    base_fields_by_suffix = {
+        suffix: _get_split_base_fields(info or {}, split_fields)
+        for suffix, info in split_map.items()
+    }
+    def _skip(msg):
+        if verboseLevel >= 2:
+            print(f"[sd_split_linear] Skip {msg}")
+
+    bases = {}
+    for key in state_dict.keys():
+        for suffix, base_fields in base_fields_by_suffix.items():
+            for base_field in base_fields:
+                suffix_token = f"{suffix}.{base_field}"
+                if not key.endswith(suffix_token):
+                    continue
+                base = key[: -len("." + base_field)]
+                if base.endswith(suffix):
+                    bases[base] = suffix
+                break
+
+    if not bases:
+        return state_dict
+
+    for base, suffix in bases.items():
+        info = split_map.get(suffix) or {}
+        mapped = info.get("mapped_modules") or info.get("mapped_suffixes") or info.get("mapped") or []
+        if not mapped:
+            continue
+
+        base_fields = base_fields_by_suffix.get(suffix) or _get_split_base_fields(info, split_fields)
+        size_field = info.get("size_field") or (base_fields[0] if base_fields else None)
+        size_tensor = state_dict.get(base + "." + size_field) if size_field else None
+        split_dim = info.get("split_dim", 0)
+        split_sizes = list(info.get("split_sizes") or [])
+        if not split_sizes:
+            if size_tensor is None:
+                continue
+            if size_tensor.dim() <= split_dim:
+                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
+                continue
+            out_dim = size_tensor.size(split_dim)
+            if out_dim % len(mapped) != 0:
+                _skip(f"{base}: out_dim={out_dim} not divisible by {len(mapped)}")
+                continue
+            split_sizes = [out_dim // len(mapped)] * len(mapped)
+        elif None in split_sizes:
+            if size_tensor is None:
+                continue
+            if size_tensor.dim() <= split_dim:
+                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
+                continue
+            known = sum(size for size in split_sizes if size is not None)
+            none_count = split_sizes.count(None)
+            remaining = size_tensor.size(split_dim) - known
+            if remaining < 0 or remaining % none_count != 0:
+                _skip(f"{base}: cannot resolve split sizes")
+                continue
+            fill = remaining // none_count
+            split_sizes = [fill if size is None else size for size in split_sizes]
+
+        total = sum(split_sizes)
+        prefix = base[: -len(suffix)]
+        target_bases = [prefix + name for name in mapped]
+        added = 0
+
+        field_tensors = {
+            field: state_dict.get(base + "." + field)
+            for field in set(split_fields.keys()).union(share_fields)
+        }
+        base_ctx = {
+            "state_dict": state_dict,
+            "base": base,
+            "suffix": suffix,
+            "split_sizes": split_sizes,
+            "total": total,
+            "mapped": mapped,
+            "target_bases": target_bases,
+            "verboseLevel": verboseLevel,
+            "split_fields": split_fields,
+            "share_fields": share_fields,
+            "field_tensors": field_tensors,
+            "size_field": size_field,
+            "size_tensor": size_tensor,
+            "split_dim": split_dim,
+            "info": info,
+        }
+        fields_iter = list(split_fields.items()) + [(field, None) for field in share_fields]
+        for field, dim in fields_iter:
+            src = field_tensors.get(field)
+            if src is None:
+                continue
+            if dim is None:
+                for target_base in target_bases:
+                    dest_key = target_base + "." + field
+                    if dest_key not in state_dict:
+                        state_dict[dest_key] = src
+                        added += 1
+                continue
+            if src.dim() <= dim:
+                _skip(f"{base}.{field}: dim={src.dim()} split_dim={dim}")
+                continue
+            if src.size(dim) != total:
+                _skip(f"{base}.{field}: size({dim})={src.size(dim)} expected={total}")
+                continue
+            handler = _get_split_handler(info, field, split_handlers)
+            chunks = _call_split_handler(
+                handler,
+                src=src,
+                dim=dim,
+                split_sizes=split_sizes,
+                context=dict(base_ctx, field=field),
+            )
+            if chunks is None:
+                chunks = torch.split(src, split_sizes, dim=dim)
+            for target_base, chunk in zip(target_bases, chunks):
+                if torch.is_tensor(chunk) and not chunk.is_contiguous():
+                    chunk = chunk.contiguous()
+                dest_key = target_base + "." + field
+                if dest_key not in state_dict:
+                    state_dict[dest_key] = chunk
+                    added += 1
+
+        if added:
+            for field in list(split_fields.keys()) + list(share_fields):
+                state_dict.pop(base + "." + field, None)
+            if verboseLevel >= 2:
+                print(f"[sd_split_linear] Split {base} -> {', '.join(mapped)}")
+
+    return state_dict
+
+
+def split_linear_modules(model, map, split_handlers=None, share_fields=None):
+    from optimum.quanto import QModuleMixin
     from accelerate import init_empty_weights
+
+    split_handlers = split_handlers or {}
+    share_fields = share_fields or ()
 
     modules_dict = { k: m for k, m in model.named_modules()}
     for module_suffix, split_info in map.items():
         mapped_modules = split_info["mapped_modules"]
         split_sizes = split_info["split_sizes"]
+        split_share_fields = _merge_share_fields(split_info, share_fields)
+        split_dims = split_info.get("split_dims") or {}
         for k, module in modules_dict.items():
             if k.endswith("." + module_suffix):
                 parent_module = modules_dict[k[:len(k)-len(module_suffix)-1]]
                 weight = module.weight
                 bias = getattr(module, "bias", None) 
                 if isinstance(module, QModuleMixin):
-                    _data = weight._data
-                    _scale = weight._scale
-                    sub_data = torch.split(_data, split_sizes, dim=0)
-                    sub_scale = torch.split(_scale, split_sizes, dim=0)
-                    sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
-                    for sub_name, _subdata, _subbias, _subscale in zip(mapped_modules, sub_data, sub_bias, sub_scale):
+                    out_features_total = weight.size(0)
+                    if sum(split_sizes) != out_features_total:
+                        raise ValueError(
+                            f"Split sizes {split_sizes} do not match out_features {out_features_total} for '{k}'."
+                        )
+                    in_features = weight.size(1)
+                    sub_biases = None
+                    if bias is not None and bias.dim() > 0 and bias.size(0) == out_features_total:
+                        sub_biases = torch.split(bias, split_sizes, dim=0)
+                    else:
+                        sub_biases = [bias] * len(split_sizes)
+
+                    sub_tensors = _get_quantized_subtensors(weight)
+                    if not sub_tensors:
+                        raise ValueError(f"Unable to split quantized weight for '{k}'.")
+                    sub_maps = [dict() for _ in split_sizes]
+                    field_tensors = {name: tensor for name, tensor in sub_tensors}
+                    base_ctx = {
+                        "module": module,
+                        "module_name": k,
+                        "module_suffix": module_suffix,
+                        "mapped_modules": mapped_modules,
+                        "split_sizes": split_sizes,
+                        "out_features": out_features_total,
+                        "in_features": in_features,
+                        "field_tensors": field_tensors,
+                        "info": split_info,
+                    }
+                    for name, tensor in sub_tensors:
+                        if tensor is None or name in split_share_fields or tensor.dim() <= 1:
+                            _fill_sub_maps(sub_maps, name, tensor)
+                            continue
+                        split_dim = split_dims.get(name)
+                        if split_dim is None:
+                            if tensor.size(0) == out_features_total:
+                                split_dim = 0
+                            elif tensor.dim() > 1 and tensor.size(1) == out_features_total:
+                                split_dim = 1
+                            else:
+                                split_dim = 0
+                        handler = _get_split_handler(split_info, name, split_handlers)
+                        chunks = _call_split_handler(
+                            handler,
+                            src=tensor,
+                            dim=split_dim,
+                            split_sizes=split_sizes,
+                            context=dict(base_ctx, split_dim=split_dim),
+                        )
+                        if chunks is None:
+                            if tensor.dim() <= split_dim or tensor.size(split_dim) != out_features_total:
+                                got_size = "n/a" if tensor.dim() <= split_dim else tensor.size(split_dim)
+                                raise ValueError(
+                                    f"Cannot split '{k}' quantized tensor '{name}': "
+                                    f"expected size({split_dim})={out_features_total}, got {got_size}."
+                                )
+                            chunks = torch.split(tensor, split_sizes, dim=split_dim)
+                        for sub_map, chunk in zip(sub_maps, chunks):
+                            sub_map[name] = chunk
+
+                    create_fn = getattr(weight.__class__, "create", None)
+                    if not callable(create_fn):
+                        raise ValueError(f"Quantized weight class '{weight.__class__.__name__}' has no create()")
+                    create_sig = inspect.signature(create_fn)
+                    base_kwargs = {
+                        "qtype": getattr(weight, "qtype", None),
+                        "axis": getattr(weight, "axis", None),
+                        "stride": weight.stride(),
+                        "dtype": weight.dtype,
+                        "activation_qtype": getattr(weight, "activation_qtype", None),
+                        "requires_grad": weight.requires_grad,
+                        "group_size": getattr(weight, "_group_size", None),
+                        "device": weight.device,
+                    }
+
+                    qmodule_cls = module.__class__
+                    for sub_name, sub_size, sub_map, sub_bias in zip(
+                        mapped_modules, split_sizes, sub_maps, sub_biases
+                    ):
                         with init_empty_weights():
-                            sub_module = QLinear(_subdata.shape[1], _subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
-                        sub_module.weight = torch.nn.Parameter(WeightQBytesTensor.create(weight.qtype, weight.axis, _subdata.size(), weight.stride(), _subdata, _subscale, activation_qtype=weight.activation_qtype, requires_grad=weight.requires_grad ))
-                        if bias != None:                        
-                            sub_module.bias = torch.nn.Parameter(_subbias)
+                            sub_module = qmodule_cls(
+                                in_features,
+                                sub_size,
+                                bias=bias is not None,
+                                device="cpu",
+                                dtype=weight.dtype,
+                                weights=module.weight_qtype,
+                                activations=module.activation_qtype,
+                                optimizer=module.optimizer,
+                                quantize_input=True,
+                            )
+                        size = list(weight.size())
+                        if size:
+                            size[0] = sub_size
+                        base_kwargs["size"] = tuple(size)
+                        create_kwargs = {}
+                        missing = []
+                        for name, param in create_sig.parameters.items():
+                            if name == "self":
+                                continue
+                            if name in sub_map:
+                                create_kwargs[name] = sub_map[name]
+                            elif name in base_kwargs and base_kwargs[name] is not None:
+                                create_kwargs[name] = base_kwargs[name]
+                            elif param.default is param.empty:
+                                missing.append(name)
+                        if missing:
+                            raise ValueError(
+                                f"Unable to rebuild quantized weight for '{k}.{sub_name}': "
+                                f"missing {missing}."
+                            )
+                        sub_weight = create_fn(**create_kwargs)
+                        sub_module.weight = torch.nn.Parameter(sub_weight, requires_grad=weight.requires_grad)
+                        if sub_bias is not None:
+                            sub_module.bias = torch.nn.Parameter(sub_bias)
                         sub_module.optimizer = module.optimizer
                         sub_module.weight_qtype = module.weight_qtype
+                        sub_module.activation_qtype = module.activation_qtype
                         setattr(parent_module, sub_name, sub_module)
-                    # del _data, _scale, _subdata, sub_d                
                 else:
                     sub_data = torch.split(weight, split_sizes, dim=0)
                     sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
@@ -1501,6 +2026,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         quantization_map = None
         tied_weights_map = None
         metadata = None
+        detected_kind = None
         if not (".safetensors" in file or ".sft" in file): 
             if pinToMemory:
                 raise Exception("Pinning to memory while loading only supported for safe tensors files")
@@ -1539,15 +2065,6 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                         state_dict[tied_weights] = mapped_weight
 
         if quantization_map is None:
-            detection_type = detect_safetensors_format(state_dict)
-            if detection_type["kind"] in ['scaled_fp8','fp8']:
-                conv_result = convert_scaled_fp8_to_quanto(state_dict, dtype = default_dtype, in_place= True)
-                state_dict = conv_result["state_dict"]
-                quantization_map = conv_result["quant_map"]
-                conv_result = None
-                # enable_fp8_fp32_scale_support()
-
-        if quantization_map is None:
             pos = str.rfind(file, ".")
             if pos > 0:
                 quantization_map_path = file[:pos]
@@ -1556,6 +2073,24 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             if os.path.isfile(quantization_map_path):
                 with open(quantization_map_path, 'r') as f:
                     quantization_map = json.load(f)
+
+        if quantization_map is None:
+            conv_result = detect_and_convert(state_dict, default_dtype=default_dtype, verboseLevel=verboseLevel)
+            detected_kind = conv_result.get("kind")
+            if conv_result.get("kind") not in ("none", "quanto"):
+                state_dict = conv_result["state_dict"]
+                quantization_map = conv_result["quant_map"]
+                conv_result = None
+                # enable_fp8_fp32_scale_support()
+
+            if detected_kind in (None, "none") and (".safetensors" in file or ".sft" in file):
+                try:
+                    info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel)
+                    detected_kind = info.get("kind")
+                except Exception:
+                    detected_kind = detected_kind or None
+            if detected_kind not in (None, "none"):
+                cache_quantization_for_file(file, detected_kind or "none")
         
         full_state_dict.update(state_dict)
         if quantization_map != None:
@@ -1583,11 +2118,21 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         if quantization_map != None:
             quantization_map = filter_state_dict(quantization_map,base_model_prefix)
 
+    post_load_hooks = []
+    if quantization_map:
+        quantization_map, post_load_hooks = apply_pre_quantization(
+            model,
+            state_dict,
+            quantization_map,
+            default_dtype=default_dtype,
+            verboseLevel=verboseLevel,
+        )
+
     if len(quantization_map) == 0:
         if any("quanto" in file for file in file_path) and not do_quantize:
             print("Model seems to be quantized by quanto but no quantization map was found whether inside the model or in a separate '{file_path[:json]}_map.json' file")
     else:
-        _requantize(model, state_dict, quantization_map)    
+        _requantize(model, state_dict, quantization_map, default_dtype=default_dtype)    
 
 
 
@@ -1605,6 +2150,14 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
         
     del state_dict
+
+    if post_load_hooks:
+        for hook in post_load_hooks:
+            try:
+                hook(model)
+            except Exception as e:
+                if verboseLevel >= 2:
+                    print(f"Post-load hook skipped: {e}")
 
     if len(unexpected_keys) > 0 and verboseLevel >=2 and not ignore_unused_weights:
         print(f"Unexpected keys while loading '{file_path}': {unexpected_keys}")
@@ -1852,22 +2405,12 @@ class offload:
             param_size = 0
             ref = _get_tensor_ref(p)
             tied_param =  self.parameters_ref.get(ref, None)
-            if isinstance(p, QTensor):
-                blocks_params.append( (submodule, k, p, False, tied_param ) )
-
-                if p._qtype == qint4:
-                    if hasattr(p,"_scale_shift"):
-                        param_size += torch.numel(p._scale_shift) * p._scale_shift.element_size()
-                        param_size += torch.numel(p._data._data) * p._data._data.element_size()
-                    else:
-                        param_size += torch.numel(p._scale) * p._scale.element_size()
-                        param_size += torch.numel(p._shift) * p._shift.element_size()
-                        param_size += torch.numel(p._data._data) * p._data._data.element_size()
-                else:
-                    param_size += torch.numel(p._scale) * p._scale.element_size()
-                    param_size += torch.numel(p._data) * p._data.element_size()
+            blocks_params.append((submodule, k, p, False, tied_param))
+            sub_tensors = _get_quantized_subtensors(p)
+            if sub_tensors:
+                param_size += _subtensors_nbytes(sub_tensors)
+                del sub_tensors
             else:
-                blocks_params.append( (submodule, k, p, False, tied_param) )
                 param_size += torch.numel(p.data) * p.data.element_size()
 
 
@@ -2293,10 +2836,12 @@ class offload:
         active_adapters = model._loras_active_adapters
         loras_scaling = model._loras_scaling
         any_dora = loras_data.get("any_dora", False)
+        is_nvfp4 = getattr(submodule, "is_nvfp4", False)
         training = False
 
-        dtype = weight.dtype 
-        if weight.shape[-1] < x.shape[-2] or any_dora: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+        dtype = weight.dtype
+        input_dtype = x.dtype
+        if (weight.shape[-1] < x.shape[-2] and False or any_dora): # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
             original_bias = True
             original_bias = True
             if len(active_adapters) > 0:
@@ -2312,6 +2857,13 @@ class offload:
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
                     if scaling == 0 or g_abs is not None:
                         continue
+                    target_dtype = weight.dtype
+                    if lora_A_weight is not None and lora_A_weight.dtype != target_dtype:
+                        lora_A_weight = lora_A_weight.to(target_dtype)
+                    if lora_B_weight is not None and lora_B_weight.dtype != target_dtype:
+                        lora_B_weight = lora_B_weight.to(target_dtype)
+                    if diff_b is not None and diff_b.dtype != target_dtype:
+                        diff_b = diff_b.to(target_dtype)
                     if lora_A_weight != None:
                         weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
                     
@@ -2332,13 +2884,22 @@ class offload:
                 pass
                 # result = torch.nn.functional.linear(dropout(x), base_weight, bias=submodule.bias)
             else:
-                result = torch.nn.functional.linear(x, weight, bias=bias)
+                base_bias = bias
+                if base_bias is not None and base_bias.dtype != x.dtype:
+                    base_bias = base_bias.to(x.dtype)
+                result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
         else:
-            result = torch.nn.functional.linear(x, weight, bias=bias)
+            base_bias = bias
+            if base_bias is not None and base_bias.dtype != x.dtype:
+                base_bias = base_bias.to(x.dtype)
+            result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
             if len(active_adapters) > 0:
-                x = x.to(dtype)
+                compute_dtype = torch.float32 if is_nvfp4 else result.dtype
+                if result.dtype != compute_dtype:
+                    result = result.to(compute_dtype)
+                x = x.to(compute_dtype)
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
@@ -2349,21 +2910,27 @@ class offload:
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
                     if scaling == 0 or g_abs is not None:
                         continue
+                    target_dtype = result.dtype
+                    if lora_A is not None and lora_A.dtype != target_dtype:
+                        lora_A = lora_A.to(target_dtype)
+                    if lora_B is not None and lora_B.dtype != target_dtype:
+                        lora_B = lora_B.to(target_dtype)
+                    if diff_b is not None and diff_b.dtype != target_dtype:
+                        diff_b = diff_b.to(target_dtype)
 
                     if lora_A == None:
                         result.add_(diff_b, alpha=scaling)
                     else:
-                        x = x.to(lora_A.dtype)
-
-                        if training:        
-                            pass                
-                            # y = lora_A(dropout(x))
-                        else:
-                            y = torch.nn.functional.linear(x, lora_A, bias=None)
-                        y = torch.nn.functional.linear(y, lora_B, bias=diff_b)
-                        y*= scaling
-                        result+= y 
+                        x_2d = x.reshape(-1, x.shape[-1])
+                        result_2d = result.reshape(-1, result.shape[-1])
+                        y = x_2d @ lora_A.T
+                        result_2d.addmm_(y, lora_B.T, beta=1, alpha=scaling)
+                        if diff_b is not None:
+                            result_2d.add_(diff_b, alpha=scaling)
                         del y
+                target_dtype = input_dtype if is_nvfp4 else dtype
+                if result.dtype != target_dtype:
+                    result = result.to(target_dtype)
 
         return result
 
@@ -2376,7 +2943,7 @@ class offload:
         loras_model_shortcuts[submodule_name] = loras_data
         loras_model_data[submodule] = loras_data
 
-        if isinstance(submodule,  torch.nn.Linear):
+        if isinstance(submodule,  torch.nn.Linear) or getattr(submodule, "is_nvfp4", False):
             def lora_linear_forward(module,  *args, **kwargs):
                 if len(loras_data) == 0:
                     return old_forward(*args, **kwargs)
@@ -2777,20 +3344,15 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             ignore_dtype = hasattr(m, "_lock_dtype")
             for n, p in m.named_parameters(recurse = False):
                 p.requires_grad = False
-                if isinstance(p, QTensor):
-                    if p._qtype == qint4:
-                        if hasattr(p,"_scale_shift"):
-                            current_model_size +=  torch.numel(p._scale_shift) * p._scale_shift.element_size()
-                        else:
-                            current_model_size +=  torch.numel(p._scale) * p._shift.element_size() + torch.numel(p._scale) * p._shift.element_size()
-
-                        current_model_size +=  torch.numel(p._data._data) * p._data._data.element_size()
-
-                    else:
-                        current_model_size +=  torch.numel(p._scale) * p._scale.element_size()
-                        current_model_size +=  torch.numel(p._data) * p._data.element_size()
-                    dtype = p._scale.dtype
-
+                sub_tensors = _get_quantized_subtensors(p)
+                if sub_tensors:
+                    current_model_size += _subtensors_nbytes(sub_tensors)
+                    dtype = sub_tensors[0][1].dtype
+                    for name, tensor in sub_tensors:
+                        if name in ("scale", "scale_shift"):
+                            dtype = tensor.dtype
+                            break
+                    del sub_tensors
                 else:
                     if not ignore_dtype:
                         dtype = p.data.dtype
