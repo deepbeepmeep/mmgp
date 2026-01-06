@@ -3247,7 +3247,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
 
     def get_parsed_budget(b):
         if isinstance(b , str) and b.endswith("%"):
-            return float(b[:-1]) * self.device_mem_capacity
+            return float(b[:-1]) / 100 * self.device_mem_capacity
         else:
             return b * ONE_MB
 
