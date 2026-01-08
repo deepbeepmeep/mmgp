@@ -1,9 +1,12 @@
 import importlib
 import inspect
+import os
 
 import torch
 from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype
+
+from . import safetensors2
 
 
 _QTYPE_QMODULE_CACHE = None
@@ -190,8 +193,10 @@ class QLinearQuantoRouter(QModuleMixin, torch.nn.Linear):
         )
 
 
+_FP8_QUANTO_BRIDGE_MODULE = ".fp8_quanto_bridge"
+
 _HANDLER_MODULES = [
-    ".fp8_quanto_bridge"
+    _FP8_QUANTO_BRIDGE_MODULE,
 ]
 _HANDLER_OBJECTS = []
 
@@ -207,6 +212,21 @@ def register_handler(handler):
         _HANDLER_OBJECTS.append(handler)
         _QTYPE_QMODULE_CACHE = None
     return handler
+
+
+def unregister_handler(handler):
+    global _QTYPE_QMODULE_CACHE
+    removed = False
+    if isinstance(handler, str):
+        if handler in _HANDLER_MODULES:
+            _HANDLER_MODULES.remove(handler)
+            removed = True
+    elif handler in _HANDLER_OBJECTS:
+        _HANDLER_OBJECTS.remove(handler)
+        removed = True
+    if removed:
+        _QTYPE_QMODULE_CACHE = None
+    return removed
 
 
 def _load_handlers():
@@ -272,6 +292,179 @@ def detect_and_convert(state_dict, default_dtype, verboseLevel=1):
     raise RuntimeError(f"Unsupported quantization format '{kind}'")
 
 
+def get_available_qtypes():
+    try:
+        from optimum.quanto.tensor.qtype import qtypes as _quanto_qtypes
+    except Exception:
+        return []
+    return sorted(_quanto_qtypes.keys())
+
+
+def get_available_qtype_aliases():
+    aliases = set()
+    for name in get_available_qtypes():
+        key = str(name).lower()
+        aliases.add(key)
+        if key.startswith("q") and len(key) > 1:
+            aliases.add(key[1:])
+        if "float8" in key:
+            aliases.add("fp8")
+    return aliases
+
+
+def get_quantization_tokens(quantization):
+    if quantization is None:
+        return []
+    key = str(quantization).lower()
+    if len(key) == 0:
+        return []
+    aliases = get_available_qtype_aliases()
+    if key not in aliases:
+        return []
+    tokens = {key}
+    if key.startswith("q") and len(key) > 1:
+        tokens.add(key[1:])
+    if "float8" in key or key == "fp8":
+        tokens.add("fp8")
+    if "int4" in key:
+        tokens.add("int4")
+    if "int8" in key:
+        tokens.add("int8")
+    return sorted(tokens, key=len, reverse=True)
+
+
+def get_quantization_label(quantization):
+    if quantization is None:
+        return ""
+    key = str(quantization).lower()
+    if key in ("", "none", "bf16", "fp16", "float16", "bfloat16"):
+        return ""
+    aliases = get_available_qtype_aliases()
+    if key not in aliases:
+        return ""
+    if "float8" in key or key == "fp8":
+        return "FP8"
+    if key.startswith("q"):
+        key = key[1:]
+    return key.replace("_", " ").upper()
+
+
+_quantization_filename_cache = {}
+
+
+def _normalize_quant_file_key(file_path):
+    try:
+        return os.path.normcase(os.path.abspath(file_path))
+    except Exception:
+        return str(file_path).lower()
+
+
+def get_cached_quantization_for_file(file_path):
+    if not file_path:
+        return None
+    return _quantization_filename_cache.get(_normalize_quant_file_key(file_path))
+
+
+def cache_quantization_for_file(file_path, kind):
+    if not file_path or not kind:
+        return
+    key = _normalize_quant_file_key(file_path)
+    if key not in _quantization_filename_cache:
+        _quantization_filename_cache[key] = kind
+
+
+def _infer_qtype_from_quantization_map(quantization_map):
+    if not quantization_map:
+        return None
+    counts = {}
+    for entry in quantization_map.values():
+        if not isinstance(entry, dict):
+            continue
+        weights = entry.get("weights")
+        if not weights or weights == "none":
+            continue
+        counts[weights] = counts.get(weights, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=counts.get)
+
+
+def detect_quantization_kind_for_file(file_path, verboseLevel=1):
+    cached = get_cached_quantization_for_file(file_path)
+    if cached:
+        return cached
+    if not file_path or not os.path.isfile(file_path):
+        return None
+    if not (".safetensors" in file_path or ".sft" in file_path):
+        return None
+
+    def _load_full():
+        state_dict = {}
+        with safetensors2.safe_open(
+            file_path,
+            framework="pt",
+            device="cpu",
+            writable_tensors=False,
+        ) as f:
+            for key in f.keys():
+                state_dict[key] = f.get_tensor(key)
+            metadata = f.metadata()
+        return state_dict, metadata
+
+    def _try_detect(state_dict):
+        try:
+            info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel)
+            return info.get("kind"), True
+        except Exception:
+            return None, False
+
+    metadata_only = False
+    try:
+        state_dict, metadata = safetensors2.load_metadata_state_dict(file_path)
+        metadata_only = True
+    except Exception:
+        try:
+            state_dict, metadata = _load_full()
+        except Exception:
+            return None
+
+    kind, ok = _try_detect(state_dict)
+    if metadata_only and not ok:
+        try:
+            state_dict, metadata = _load_full()
+            kind, ok = _try_detect(state_dict)
+        except Exception:
+            kind = None
+
+    if (not kind or kind == "none") and metadata is not None:
+        inferred = _infer_qtype_from_quantization_map(metadata.get("quantization_map"))
+        if inferred:
+            kind = inferred
+
+    cache_quantization_for_file(file_path, kind or "none")
+    return kind
+
+
+def detect_quantization_label_from_filename(filename):
+    if not filename:
+        return ""
+    cached = get_cached_quantization_for_file(filename)
+    if cached:
+        return get_quantization_label(cached)
+    kind = detect_quantization_kind_for_file(filename, verboseLevel=0)
+    if kind:
+        label = get_quantization_label(kind)
+        if label:
+            return label
+    base = os.path.basename(filename).lower()
+    for token in sorted(get_available_qtype_aliases(), key=len, reverse=True):
+        if token and token in base:
+            return get_quantization_label(token)
+    if "quanto" in base:
+        return "QUANTO"
+    return ""
+
+
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
     remaining = dict(quantization_map or {})
     post_load = []
@@ -289,3 +482,37 @@ def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=No
         if hooks:
             post_load.extend(hooks)
     return remaining, post_load
+
+def _patch_marlin_fp8_bias():
+    """
+    Quanto's Marlin FP8 CUDA kernel currently ignores the bias argument.
+    Add it back manually (in-place) so outputs stay correct on CUDA builds.
+    """
+    try:
+        from optimum.quanto.tensor.weights.marlin.fp8 import qbits as marlin_fp8
+    except Exception:
+        return
+    if getattr(marlin_fp8.MarlinF8QBytesLinearFunction, "_wan2gp_bias_patch", False):
+        return
+
+    orig_forward = marlin_fp8.MarlinF8QBytesLinearFunction.forward
+
+    def forward_with_bias(ctx, input, other, bias=None):
+        out = orig_forward(ctx, input, other, None)
+        if bias is None:
+            return out
+        bias_to_add = bias
+        if bias_to_add.device != out.device or bias_to_add.dtype != out.dtype:
+            bias_to_add = bias_to_add.to(device=out.device, dtype=out.dtype)
+        view_shape = [1] * out.ndim
+        view_shape[-1] = bias_to_add.shape[0]
+        bias_view = bias_to_add.view(*view_shape)
+        out.add_(bias_view)
+        return out
+
+    marlin_fp8.MarlinF8QBytesLinearFunction.forward = staticmethod(forward_with_bias)  # type: ignore
+    marlin_fp8.MarlinF8QBytesLinearFunction._wan2gp_bias_patch = True  # type: ignore
+    marlin_fp8.MarlinF8QBytesLinearFunction._wan2gp_bias_orig = orig_forward  # type: ignore
+
+
+_patch_marlin_fp8_bias()
