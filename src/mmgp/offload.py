@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.11 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.12 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -405,9 +405,8 @@ def _subtensors_nbytes(sub_tensors):
     return sum(torch.numel(t) * t.element_size() for _, t in sub_tensors)
 
 def _subtensors_itemsize(sub_tensors, fallback):
-    for _, t in sub_tensors:
-        return t.element_size()
-    return fallback
+    sizes = [t.element_size() for _, t in sub_tensors]
+    return max(sizes) if sizes else fallback
 
 def _get_tensor_ref(p):
     sub_tensors = _get_quantized_subtensors(p)
@@ -776,7 +775,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.11) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.12) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1401,7 +1400,7 @@ def split_linear_modules(model, map, split_handlers=None, share_fields=None):
                 delattr(parent_module, module_suffix)
 
 
-def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
+def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, maxReservedLoras = -1, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     loras_model_data = getattr(model, "_loras_model_data", None)
@@ -1459,12 +1458,26 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             return text
         else:
             return text[0:sz] + '...'
+    
+    def _state_dict_size_mb(state_dict):
+        total_bytes = 0
+        for v in state_dict.values():
+            if torch.is_tensor(v):
+                total_bytes += v.numel() * v.element_size()
+        return total_bytes / (1024 * 1024)
 
     if not isinstance(lora_path, list):
         lora_path = [lora_path]
     
     if lora_multi is None:
         lora_multi = [1. for _ in lora_path]
+    try:
+        max_reserved_loras_mb = float(maxReservedLoras)
+    except Exception:
+        max_reserved_loras_mb = -1
+    if max_reserved_loras_mb is None:
+        max_reserved_loras_mb = -1
+    pinned_total_mb = 0.0
     loras_nos = []
     loras_multi = []
     new_lora_path = []
@@ -1689,8 +1702,15 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             if not check_only:
                 # model._loras_tied_weights[adapter_name] = tied_weights
                 if pinnedLora:
-                    pinned_sd_list.append(new_state_dict)
-                    pinned_names_list.append(path)
+                    if max_reserved_loras_mb < 0:
+                        pinned_sd_list.append(new_state_dict)
+                        pinned_names_list.append(path)
+                    else:
+                        lora_size_mb = _state_dict_size_mb(new_state_dict)
+                        if pinned_total_mb + lora_size_mb <= max_reserved_loras_mb:
+                            pinned_sd_list.append(new_state_dict)
+                            pinned_names_list.append(path)
+                            pinned_total_mb += lora_size_mb
                     # _pin_sd_to_memory(state_dict, path)
 
             del state_dict 
@@ -3005,7 +3025,9 @@ def {fname}(module, *args, **kwargs):
     def hook_check_load_into_GPU_if_needed_default(self, target_module, model, model_id, blocks_name, previous_method,  context):
 
         dtype = model._dtype
-        qint4quantization =  isinstance(target_module, QModuleMixin) and  target_module.weight!= None and  target_module.weight.qtype == qint4 
+        weight = getattr(target_module, "weight", None)
+        weight_qtype = getattr(weight, "qtype", None) if weight is not None else None
+        qint4quantization = isinstance(target_module, QModuleMixin) and weight_qtype == qint4
         if qint4quantization:
             pass
 
@@ -3450,6 +3472,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 else:
                     submodule_method = getattr(submodule, submodule_method_name)
                 if callable(submodule_method):
+                    if top_submodule and cur_blocks_name is None and any_lora and len(submodule._parameters):
+                        pass
                     if top_submodule and cur_blocks_name is None and not (any_lora and len(submodule._parameters)):
                         self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method, submodule_method_name)
                     elif compilationInThisOne and submodule in towers_modules: 
