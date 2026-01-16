@@ -62,7 +62,7 @@ class MmapTracker:
         self.count += 1
         def finalizer(ref):
             self._already_released += 1
-            if verboseLevel >=2:
+            if verboseLevel is not None and verboseLevel >=2:
                 if self.count == self._already_released:
                     text =" (all the mmaps have been released)"
                 else:
@@ -346,10 +346,10 @@ class SafeTensorFile:
         current_map_start = (skip_bytes // PAGE_SIZE) * PAGE_SIZE
         current_map_size = skip_bytes - current_map_start
         idx = 0
-        for k,v in self._catalog.items():
+        for entry_no, (k,v) in enumerate(self._catalog.items()):
             data_offsets = v["data_offsets"]
             length = data_offsets[1]-data_offsets[0]
-            if current_map_size + length > MMAP_SIZE:
+            if current_map_size + length > MMAP_SIZE and entry_no:
                 maps_info.append((current_map_start, current_map_size))
                 current_map_start = (current_pos // PAGE_SIZE) * PAGE_SIZE
                 current_map_size = current_pos - current_map_start

@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.12 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.15 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -67,6 +67,7 @@ from accelerate import init_empty_weights
 from functools import wraps
 import functools
 import types
+import inspect
 
 from mmgp import safetensors2
 from mmgp import profile_type
@@ -290,7 +291,9 @@ def _move_to_pinned_tensor(source_tensor, big_tensor, offset, length):
         t = source_tensor.view(torch.uint8)
         t = torch.reshape(t, (length,))
     else:
-        t = source_tensor
+        # Preserve raw bytes for 0-dim tensors (scalar buffers like embed_scale).
+        t = source_tensor.view(1).view(torch.uint8)
+        t = torch.reshape(t, (length,))
     # magic swap !
     big_tensor[offset: offset + length] = t 
     t = big_tensor[offset: offset + length]
@@ -418,7 +421,6 @@ def _get_tensor_ref(p):
         del sub_tensors
     return p.data_ptr()
 
-
 BIG_TENSOR_MAX_SIZE = 2**28 # 256 MB
 BIG_TENSOR_MIN_SIZE = 2**26 # 64 MB
 RESERVED_RAM_MIN_AVAILABLE = BIG_TENSOR_MAX_SIZE # 2**27 # 128 MB
@@ -514,8 +516,8 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
         dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
     except:
         print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less 0.3")
-        gc.collect()
-        torch.cuda.empty_cache()
+        dummy_pinned_tensor = None
+        flush_torch_caches()
         return
     
     for size in big_tensors_sizes:
@@ -524,7 +526,9 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
             big_tensors.append(current_big_tensor)
         except:
             incomplete_pinning = True
+            current_big_tensor = None
             print(f"Unable to pin more tensors for '{sd_name}' as the maximum reservable memory has been reached ({total/ONE_MB:.2f}). Transfer speed from RAM to VRAM may be slower.")
+            flush_torch_caches()
             break
 
         last_big_tensor += 1
@@ -669,13 +673,12 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
             current_big_tensor_size += length
 
             total_tensor_bytes += length
-    p = None
     if verboseLevel >=1 and tied_weights_count > 0:
         if  tied_weights_count == 1:
             print(f"Tied weights of {tied_weights_total/ONE_MB:0.2f} MB detected: {tied_weights_last}")
         else:
             print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
-                
+              
 
     big_tensors_sizes.append(current_big_tensor_size)
 
@@ -688,6 +691,8 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
     try:
         dummy_pinned_tensor = torch.empty( RESERVED_RAM_MIN_AVAILABLE, dtype= torch.uint8, pin_memory=True, device="cpu")
     except:
+        dummy_pinned_tensor = None
+        flush_torch_caches()
         print("There isn't any Reserved RAM left, you may need to choose a profile with a higher number that requires less Reserved RAM or set OS env 'perc_reserved_mem_max' to a value less than{perc_reserved_mem_max}")
         return
 
@@ -728,6 +733,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                     dummy_pinned_tensor = None
                     failed_planned_allocation = True
                     max_pinnable_bytes = total_pinned_bytes + total
+                    flush_torch_caches()
                     break
 
                 total += size
@@ -744,6 +750,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
                     length = torch.numel(tensor) * tensor.element_size()
                     new_subs[name] = _move_to_pinned_tensor(tensor, current_big_tensor, sub_offset, length)
                     sub_offset += length
+                    tensor = None
                 _set_quantized_subtensors(p, new_subs)
                 del new_subs, sub_tensors
             else:
@@ -752,7 +759,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
             tensor_no += 1
         del p
-    del dummy_pinned_tensor
+    del dummy_pinned_tensor,tied_weights, ref_cache
     model._pinned_bytes = total
     total_pinned_bytes += total
     del params_dict
@@ -775,7 +782,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.12) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.15) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1893,7 +1900,6 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
         #needed to keep inits of non persistent buffers
         with init_empty_weights():
             model = transfomer_class(config_obj)
-                
 
     else:
         if modelClass !=None:
@@ -1917,18 +1923,87 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     return model
 
+def flush_torch_caches():
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except torch.cuda.CudaError:
+            pass
+        for idx in range(torch.cuda.device_count()):
+            with torch.cuda.device(idx):
+                torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        torch._C._host_emptyCache()
+    except AttributeError:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes, ctypes.wintypes as wintypes, os as _os
+            PROCESS_SET_QUOTA = 0x0100
+            PROCESS_QUERY_INFORMATION = 0x0400
+            kernel32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            handle = kernel32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, False, _os.getpid())
+            if handle:
+                psapi.EmptyWorkingSet(handle)
+                kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+    from accelerate import init_empty_weights
+    with init_empty_weights():
+        for _ in range(3):
+            dummy_tensor = torch.nn.Embedding(256384, 1024)
+            dummy_tensor = None    
 
 
-@cudacontext("cpu")
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
-    """
-    Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
-    """
+def map_state_dict(state_dict, rules):
 
+    def map_one_sd(sd):
+        if sd is None: return None
+        for rule, repl in rules.items():
+            new_sd= {}
+            new_start = len(rule)
+            prefix = rule + "."
+            for k,v in sd.items():
+                if k.startswith(prefix):
+                    if repl is not None:
+                        if len(repl) == 0:
+                            k= k[new_start+1:]
+                        else:            
+                            k = repl + k[new_start:]
+                        if isinstance(v, list):
+                            new_v = []
+                            for sub in v:
+                                if sub.startswith(prefix):
+                                    if len(repl) == 0:
+                                        sub= sub[new_start+1:]
+                                    else:            
+                                        sub = repl + sub[new_start:]
+                                new_v.append(sub)
+                            v = new_v
 
-    def filter_state_dict(state_dict, base_model_prefix):
-        new_state_dict= {}
-        start = -1
+                        new_sd[k] = v
+                else:
+                    new_sd[k] = v
+            sd = new_sd
+        return sd
+    
+    if isinstance(state_dict, list):
+        return [map_one_sd(sd) for sd in state_dict]
+    else:
+        return map_one_sd(state_dict)
+
+def filter_state_dict_basic(state_dict, base_model_prefix, keep_prefix = False):
+    new_state_dict= {}
+    start = -1
+    if keep_prefix:
+        for k,v in state_dict.items():
+            if k.startswith(base_model_prefix):
+                new_state_dict[k] = v
+    else:
         for k,v in state_dict.items():
             if k.startswith(base_model_prefix):
 
@@ -1943,9 +2018,37 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 break
             start = new_start  
             new_state_dict[k[ start:]] = v
-        return new_state_dict
+    return new_state_dict
 
+def load_sd(file_path, filters = None, keep_prefixes = False, writable_tensors = True):
+    state_dict, metadata = _safetensors_load_file(file_path, writable_tensors =writable_tensors)
+    quantization_map = None
+    tied_weights_map = None
+    if metadata !=  None:
+        quantization_map = metadata.get("quantization_map", None)
+        tied_weights_map = metadata.get("tied_weights_map", None)
 
+    if filters is not None:
+        if not isinstance(filters, list): filters = [filters]
+        new_sd = {}
+        new_quantization_map = {}
+        new_tied_weights_map = {}
+        for one_filter in filters:
+            new_sd.update(filter_state_dict_basic(state_dict, one_filter, keep_prefixes))
+            if quantization_map is not None:
+                new_quantization_map.update(filter_state_dict_basic(quantization_map, one_filter, keep_prefixes))
+            if tied_weights_map is not None:
+                new_tied_weights_map.update(filter_state_dict_basic(tied_weights_map, one_filter, keep_prefixes))
+        state_dict = new_sd
+        quantization_map = new_quantization_map if len(new_quantization_map) else None
+        tied_weights_map = new_tied_weights_map if len(new_tied_weights_map) else None
+    return state_dict, quantization_map, tied_weights_map
+
+@cudacontext("cpu")
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
+    """
+    Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
+    """
 
     if not isinstance(file_path, list):
         file_path = [file_path]
@@ -1980,13 +2083,17 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     full_state_dict = {}
     for no, file in enumerate(file_path):
         quantization_map = None
+        hybrid_quantization_map = False
         tied_weights_map = None
         metadata = None
         detected_kind = None
         if isinstance(file, tuple):
-            if len(file) != 2:
-                raise Exception("Expected a tuple of (state_dict, quantization_map)")
-            state_dict, quantization_map = file
+            if len(file)==2:
+                state_dict, quantization_map = file
+            elif len(file)==3:
+                state_dict, quantization_map, tied_weights_map = file
+            else:
+                raise Exception("Expected a tuple of (state_dict, quantization_map, tied_weights_map)")
         elif isinstance(file, dict):
             state_dict = file
         elif not (".safetensors" in file or ".sft" in file):
@@ -2009,21 +2116,14 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             else:
                 state_dict, metadata = _safetensors_load_file(file, writable_tensors =writable_tensors)
 
-        if preprocess_sd != None:
-            state_dict = preprocess_sd(state_dict)
-
         if metadata !=  None:
-            quantization_map = metadata.get("quantization_map", None)
+            if quantization_map is None:
+                quantization_map = metadata.get("quantization_map", None)
             config = metadata.get("config", None)
             if config is not None:
                 model._config = config
-
-            tied_weights_map = metadata.get("tied_weights_map", None)
-            if tied_weights_map != None:
-                for name, tied_weights_list in tied_weights_map.items():
-                    mapped_weight = state_dict[name]
-                    for tied_weights in tied_weights_list:
-                        state_dict[tied_weights] = mapped_weight
+            if tied_weights_map is None:
+                tied_weights_map = metadata.get("tied_weights_map", None)
 
         if quantization_map is None and isinstance(file, str):
             pos = str.rfind(file, ".")
@@ -2035,12 +2135,31 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 with open(quantization_map_path, 'r') as f:
                     quantization_map = json.load(f)
 
-        if quantization_map is None:
+        if preprocess_sd != None:
+            num_params = len(inspect.signature(preprocess_sd).parameters)
+            if num_params == 1:
+                state_dict = preprocess_sd(state_dict)
+            elif num_params == 2:
+                state_dict = preprocess_sd(state_dict, quantization_map)
+            else:
+                state_dict = preprocess_sd(state_dict, quantization_map, tied_weights_map)
+            if isinstance(state_dict, tuple): state_dict, quantization_map, tied_weights_map = state_dict
+            hybrid_quantization_map = quantization_map is not None
+
+        if tied_weights_map != None:
+            for name, tied_weights_list in tied_weights_map.items():
+                mapped_weight = state_dict[name]
+                for tied_weights in tied_weights_list:
+                    state_dict[tied_weights] = mapped_weight
+
+
+        if quantization_map is None or hybrid_quantization_map :
             conv_result = detect_and_convert(state_dict, default_dtype=default_dtype, verboseLevel=verboseLevel)
             detected_kind = conv_result.get("kind")
             if conv_result.get("kind") not in ("none", "quanto"):
                 state_dict = conv_result["state_dict"]
-                quantization_map = conv_result["quant_map"]
+                quantization_map = quantization_map or {}
+                quantization_map.update(conv_result["quant_map"])
                 conv_result = None
                 # enable_fp8_fp32_scale_support()
 
@@ -2075,9 +2194,9 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         
     if modelPrefix != None:
         base_model_prefix = modelPrefix + "."
-        state_dict = filter_state_dict(state_dict,base_model_prefix)
+        state_dict = filter_state_dict_basic(state_dict,base_model_prefix)
         if quantization_map != None:
-            quantization_map = filter_state_dict(quantization_map,base_model_prefix)
+            quantization_map = filter_state_dict_basic(quantization_map,base_model_prefix)
 
     post_load_hooks = []
     if quantization_map:
@@ -2094,8 +2213,6 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             print("Model seems to be quantized by quanto but no quantization map was found whether inside the model or in a separate '{file_path[:json]}_map.json' file")
     else:
         _requantize(model, state_dict, quantization_map, default_dtype=default_dtype)    
-
-
 
     missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
     if len(missing_keys) > 0  :
@@ -3325,7 +3442,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
 
         current_model_size = 0
         model_dtype = getattr(current_model, "_model_dtype", None)
-        fp8_fallback_dtype = None
         # if model_dtype == None:
         #     model_dtype = getattr(current_model, "dtype", None)
         for _ , m in current_model.named_modules():
@@ -3335,11 +3451,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 sub_tensors = _get_quantized_subtensors(p)
                 if sub_tensors:
                     current_model_size += _subtensors_nbytes(sub_tensors)
-                    dtype = sub_tensors[0][1].dtype
-                    for name, tensor in sub_tensors:
-                        if name in ("scale", "scale_shift"):
-                            dtype = tensor.dtype
-                            break
                     del sub_tensors
                 else:
                     if not ignore_dtype:
@@ -3350,20 +3461,11 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                             if dtype != torch.float32:
                                 p.data = p.data.to(dtype)
                         if model_dtype is None:
-                            if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                                if fp8_fallback_dtype is None:
-                                    fp8_fallback_dtype = dtype
-                            else:
-                                model_dtype = dtype
+                            model_dtype = dtype
                         else:
                             if model_dtype != dtype:
-                                if (
-                                    dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                                    or model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                                ):
-                                    pass
-                                else:
-                                    assert model_dtype == dtype
+                                pass
+                            assert model_dtype == dtype
                     current_model_size +=  torch.numel(p.data) * p.data.element_size()
         if model_dtype is None and fp8_fallback_dtype is not None:
             model_dtype = fp8_fallback_dtype
