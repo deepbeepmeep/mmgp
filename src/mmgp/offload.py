@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.15 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.6.16 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -103,6 +103,38 @@ def cudacontext(device):
 
 
 shared_state = {}
+_FILE_EXTENSION_HANDLERS = {}
+
+
+def register_file_extension(extension, handler):
+    if not extension or handler is None:
+        return
+    ext = str(extension).lower()
+    if ext.startswith("."):
+        ext = ext[1:]
+    if not ext:
+        return
+    _FILE_EXTENSION_HANDLERS[ext] = handler
+
+
+def _get_extension_handler(file_path):
+    if not isinstance(file_path, str):
+        return None
+    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+    if not ext:
+        return None
+    return _FILE_EXTENSION_HANDLERS.get(ext)
+
+
+def _normalize_extension_path(file_path):
+    handler = _get_extension_handler(file_path)
+    if handler is None:
+        return file_path
+    normalizer = getattr(handler, "normalize", None)
+    if not callable(normalizer):
+        ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+        raise Exception(f"Missing normalize for *.{ext} handler")
+    return normalizer(file_path)
 
 def get_cache(cache_name):
     all_cache = shared_state.get("_cache",  None)
@@ -782,7 +814,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.15) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.16) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -872,12 +904,24 @@ def _quantize_submodule(
             del param
 
 def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict, default_dtype=None):
+    quantized_names = set(quantization_map.keys())
+
+    def _is_quantized_param(param_name):
+        if param_name in quantized_names:
+            return True
+        if "." in param_name:
+            return param_name.rsplit(".", 1)[0] in quantized_names
+        return False
+
     # change dtype of current meta model parameters because 'requantize' won't update the dtype on non quantized parameters
     for k, p in model.named_parameters():
-        if not k in quantization_map and k in state_dict:
-            p_in_file = state_dict[k] 
-            if p.data.dtype != p_in_file.data.dtype:
-                p.data = p.data.to(p_in_file.data.dtype)
+        if _is_quantized_param(k) or k not in state_dict:
+            continue
+        p_in_file = state_dict[k]
+        if not (p_in_file.data.dtype.is_floating_point or p_in_file.data.dtype.is_complex):
+            continue
+        if p.data.dtype != p_in_file.data.dtype:
+            p.data = p.data.to(p_in_file.data.dtype)
 
     # rebuild quanto objects
     for name, m in model.named_modules():
@@ -1130,8 +1174,7 @@ def sd_split_linear(
         for suffix, info in split_map.items()
     }
     def _skip(msg):
-        if verboseLevel >= 2:
-            print(f"[sd_split_linear] Skip {msg}")
+        pass
 
     bases = {}
     for key in state_dict.keys():
@@ -1250,9 +1293,6 @@ def sd_split_linear(
         if added:
             for field in list(split_fields.keys()) + list(share_fields):
                 state_dict.pop(base + "." + field, None)
-            if verboseLevel >= 2:
-                print(f"[sd_split_linear] Split {base} -> {', '.join(mapped)}")
-
     return state_dict
 
 
@@ -2044,6 +2084,7 @@ def load_sd(file_path, filters = None, keep_prefixes = False, writable_tensors =
         tied_weights_map = new_tied_weights_map if len(new_tied_weights_map) else None
     return state_dict, quantization_map, tied_weights_map
 
+
 @cudacontext("cpu")
 def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
     """
@@ -2064,7 +2105,10 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         if isinstance(file, (dict, tuple)):
             normalized_paths.append(file)
         else:
-            normalized_paths.append(_get_model(file))
+            resolved = _get_model(file)
+            if isinstance(resolved, str):
+                resolved = _normalize_extension_path(resolved)
+            normalized_paths.append(resolved)
     file_path = normalized_paths
     if any(file is None for file in file_path):
         raise Exception("Unable to find file")
@@ -2096,6 +2140,22 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 raise Exception("Expected a tuple of (state_dict, quantization_map, tied_weights_map)")
         elif isinstance(file, dict):
             state_dict = file
+        elif isinstance(file, str) and _get_extension_handler(file) is not None:
+            ext_handler = _get_extension_handler(file)
+            load_fn = getattr(ext_handler, "load_state_dict", None)
+            if not callable(load_fn):
+                ext = os.path.splitext(file)[1].lower().lstrip(".")
+                raise Exception(f"Missing load_state_dict for *.{ext} handler")
+            result = load_fn( file, writable_tensors=writable_tensors, verboseLevel=verboseLevel, default_dtype=default_dtype, pin_to_memory=pinToMemory, )
+            if isinstance(result, tuple):
+                if len(result) == 2:
+                    state_dict, quantization_map = result
+                elif len(result) == 3:
+                    state_dict, quantization_map, tied_weights_map = result
+                else:
+                    raise Exception("Expected a tuple of (state_dict, quantization_map, tied_weights_map)")
+            else:
+                state_dict = result
         elif not (".safetensors" in file or ".sft" in file):
             if pinToMemory:
                 raise Exception("Pinning to memory while loading only supported for safe tensors files")
@@ -2137,13 +2197,12 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
 
         if preprocess_sd != None:
             num_params = len(inspect.signature(preprocess_sd).parameters)
-            if num_params == 1:
-                state_dict = preprocess_sd(state_dict)
-            elif num_params == 2:
-                state_dict = preprocess_sd(state_dict, quantization_map)
-            else:
-                state_dict = preprocess_sd(state_dict, quantization_map, tied_weights_map)
-            if isinstance(state_dict, tuple): state_dict, quantization_map, tied_weights_map = state_dict
+            state_dict = preprocess_sd(*[state_dict, quantization_map, tied_weights_map][:num_params])
+            if isinstance(state_dict, tuple):
+                if len(state_dict)==2: 
+                    state_dict, quantization_map = state_dict
+                else:
+                    state_dict, quantization_map, tied_weights_map = state_dict
             hybrid_quantization_map = quantization_map is not None
 
         if tied_weights_map != None:
@@ -2190,13 +2249,21 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
 
     # deal if we are trying to load just a sub part of a larger model
     if postprocess_sd != None:
-        state_dict, quantization_map = postprocess_sd(state_dict, quantization_map)
+        num_params = len(inspect.signature(postprocess_sd).parameters)
+        state_dict = postprocess_sd(*[state_dict, quantization_map, tied_weights_map][:num_params])
+        if isinstance(state_dict, tuple):
+            if len(state_dict)==2: 
+                state_dict, quantization_map = state_dict
+            else:
+                state_dict, quantization_map, tied_weights_map = state_dict
         
     if modelPrefix != None:
         base_model_prefix = modelPrefix + "."
         state_dict = filter_state_dict_basic(state_dict,base_model_prefix)
         if quantization_map != None:
             quantization_map = filter_state_dict_basic(quantization_map,base_model_prefix)
+        if tied_weights_map != None:
+            tied_weights_map = filter_state_dict_basic(tied_weights_map,base_model_prefix)
 
     post_load_hooks = []
     if quantization_map:
@@ -2226,7 +2293,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             if not ignore_missing_keys:
                 raise Exception(f"Missing keys: {missing_keys}")
         else:
-            state_dict = filter_state_dict(state_dict, base_model_prefix)
+            state_dict = filter_state_dict_basic(state_dict, base_model_prefix)
             missing_keys , unexpected_keys = model.load_state_dict(state_dict, False,  assign = True )
             if len(missing_keys) > 0 and not ignore_missing_keys:
                 raise Exception(f"Missing keys: {missing_keys}")
@@ -2434,6 +2501,19 @@ class HfHook:
         return module
     
 def _mm_lora_linear_forward(module, *args, **kwargs):
+    if args:
+        inp = args[0]
+    else:
+        inp = kwargs.get("input", None)
+    weight = getattr(module, "weight", None)
+    if torch.is_tensor(inp) and torch.is_tensor(weight):
+        if inp.dtype != weight.dtype and inp.dtype.is_floating_point and weight.dtype.is_floating_point:
+            inp = inp.to(weight.dtype)
+            if args:
+                args = (inp,) + args[1:]
+            else:
+                kwargs = dict(kwargs)
+                kwargs["input"] = inp
     loras_data = getattr(module, "_mm_lora_data", None)
     if not loras_data:
         return module._mm_lora_old_forward(*args, **kwargs)
@@ -2947,7 +3027,6 @@ class offload:
         active_adapters = model._loras_active_adapters
         loras_scaling = model._loras_scaling
         any_dora = loras_data.get("any_dora", False)
-        is_nvfp4 = getattr(submodule, "is_nvfp4", False)
         training = False
 
         dtype = weight.dtype
@@ -3005,7 +3084,7 @@ class offload:
             result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
             if len(active_adapters) > 0:
-                compute_dtype = torch.float32 if is_nvfp4 else result.dtype
+                compute_dtype = result.dtype
                 if result.dtype != compute_dtype:
                     result = result.to(compute_dtype)
                 x = x.to(compute_dtype)
@@ -3037,7 +3116,7 @@ class offload:
                         if diff_b is not None:
                             result_2d.add_(diff_b, alpha=scaling)
                         del y
-                target_dtype = input_dtype if is_nvfp4 else dtype
+                target_dtype = dtype
                 if result.dtype != target_dtype:
                     result = result.to(target_dtype)
 
@@ -3467,8 +3546,8 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                                 pass
                             assert model_dtype == dtype
                     current_model_size +=  torch.numel(p.data) * p.data.element_size()
-        if model_dtype is None and fp8_fallback_dtype is not None:
-            model_dtype = fp8_fallback_dtype
+        if model_dtype is None:
+            model_dtype = convertWeightsFloatTo if convertWeightsFloatTo is not None else torch.bfloat16
         current_model._dtype = model_dtype
         for b in current_model.buffers():
             # do not convert 32 bits float to 16 bits since buffers are few (and potential gain low) and usually they are needed for precision calculation (for instance Rope)

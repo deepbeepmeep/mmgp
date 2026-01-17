@@ -199,6 +199,10 @@ def _read_safetensors_header(path, file):
 
 
 def load_metadata_state_dict(file_path):
+    if str(file_path).lower().endswith(".gguf"):
+        from shared.qtypes import gguf as gguf_handler
+        metadata = gguf_handler.read_gguf_metadata(file_path)
+        return OrderedDict(), metadata
     with open(file_path, 'rb') as f:
         catalog, metadata, _ = _read_safetensors_header(file_path, f)
     sd = OrderedDict()
