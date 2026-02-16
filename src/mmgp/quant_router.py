@@ -3,6 +3,7 @@ import inspect
 import os
 
 import torch
+
 from optimum.quanto import QModuleMixin, register_qmodule
 from optimum.quanto.tensor.qtype import qtype as _quanto_qtype
 
@@ -269,6 +270,39 @@ def _load_handlers():
 def _handler_name(handler):
     return getattr(handler, "HANDLER_NAME", handler.__name__.split(".")[-1])
 
+_FILE_EXTENSION_HANDLERS = {}
+
+
+def register_file_extension(extension, handler):
+    if not extension or handler is None:
+        return
+    ext = str(extension).lower()
+    if ext.startswith("."):
+        ext = ext[1:]
+    if not ext:
+        return
+    _FILE_EXTENSION_HANDLERS[ext] = handler
+
+
+def get_extension_handler(file_path):
+    if not isinstance(file_path, str):
+        return None
+    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+    if not ext:
+        return None
+    return _FILE_EXTENSION_HANDLERS.get(ext)
+
+
+def normalize_extension_path(file_path):
+    handler = get_extension_handler(file_path)
+    if handler is None:
+        return file_path
+    normalizer = getattr(handler, "normalize", None)
+    if not callable(normalizer):
+        ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+        raise Exception(f"Missing normalize for *.{ext} handler")
+    return normalizer(file_path)
+
 def _normalize_kind_key(value):
     if value is None:
         return ""
@@ -342,6 +376,378 @@ def _merge_quant_maps(target, source):
         if incoming_priority < current_priority:
             target[key] = cfg
     return target
+
+
+def _as_field_tuple(value):
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
+def _get_split_handler(info, field, default_handlers):
+    handlers = info.get("split_handlers") or info.get("field_handlers") or {}
+    if handlers:
+        handler = handlers.get(field)
+        if handler is not None:
+            return handler
+    if default_handlers:
+        return default_handlers.get(field)
+    return None
+
+
+def _get_split_base_fields(info, split_fields):
+    base_fields = _as_field_tuple(info.get("base_fields") or info.get("base_field"))
+    if base_fields:
+        return base_fields
+    if split_fields:
+        return (next(iter(split_fields.keys())),)
+    return ()
+
+
+def _merge_share_fields(info, share_fields):
+    info_fields = _as_field_tuple(info.get("share_fields") or info.get("shared_fields"))
+    return tuple(sorted(set(info_fields).union(_as_field_tuple(share_fields))))
+
+
+def _call_split_handler(handler, *, src, dim, split_sizes, context):
+    if handler is None:
+        return None
+    try:
+        chunks = handler(src=src, dim=dim, split_sizes=split_sizes, context=context)
+    except Exception:
+        return None
+    if not isinstance(chunks, (list, tuple)) or len(chunks) != len(split_sizes):
+        return None
+    return chunks
+
+
+def _fill_sub_maps(sub_maps, name, value):
+    for sub_map in sub_maps:
+        sub_map[name] = value
+
+
+def _get_quantized_subtensors(p):
+    getter = getattr(p, "get_quantized_subtensors", None)
+    if getter is None:
+        return None
+    sub_tensors = getter()
+    if not sub_tensors:
+        return None
+    if isinstance(sub_tensors, dict):
+        sub_tensors = list(sub_tensors.items())
+    out = []
+    for name, tensor in sub_tensors:
+        if tensor is None:
+            continue
+        if torch.is_tensor(tensor):
+            out.append((name, tensor))
+    return out if out else None
+
+
+def sd_split_linear(
+    state_dict,
+    split_map,
+    split_fields=None,
+    share_fields=None,
+    verboseLevel=1,
+    split_handlers=None,
+    allowed_bases=None,
+    return_split_bases=False,
+):
+    if not split_map:
+        return (state_dict, []) if return_split_bases else state_dict
+    split_fields = split_fields or {}
+    share_fields = share_fields or ()
+    split_handlers = split_handlers or {}
+    base_fields_by_suffix = {
+        suffix: _get_split_base_fields(info or {}, split_fields)
+        for suffix, info in split_map.items()
+    }
+    def _skip(msg):
+        pass
+
+    bases = {}
+    for key in state_dict.keys():
+        for suffix, base_fields in base_fields_by_suffix.items():
+            for base_field in base_fields:
+                suffix_token = f"{suffix}.{base_field}"
+                if not key.endswith(suffix_token):
+                    continue
+                base = key[: -len("." + base_field)]
+                if base.endswith(suffix):
+                    bases[base] = suffix
+                break
+
+    if allowed_bases is not None:
+        allowed_set = set(allowed_bases)
+        bases = {base: suffix for base, suffix in bases.items() if base in allowed_set}
+
+    if not bases:
+        return (state_dict, []) if return_split_bases else state_dict
+
+    split_bases = []
+
+    for base, suffix in bases.items():
+        info = split_map.get(suffix) or {}
+        mapped = info.get("mapped_modules") or info.get("mapped_suffixes") or info.get("mapped") or []
+        if not mapped:
+            continue
+
+        base_fields = base_fields_by_suffix.get(suffix) or _get_split_base_fields(info, split_fields)
+        size_field = info.get("size_field") or (base_fields[0] if base_fields else None)
+        size_tensor = state_dict.get(base + "." + size_field) if size_field else None
+        split_dim = info.get("split_dim", 0)
+        split_sizes = list(info.get("split_sizes") or [])
+        if not split_sizes:
+            if size_tensor is None:
+                continue
+            if size_tensor.dim() <= split_dim:
+                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
+                continue
+            out_dim = size_tensor.size(split_dim)
+            if out_dim % len(mapped) != 0:
+                _skip(f"{base}: out_dim={out_dim} not divisible by {len(mapped)}")
+                continue
+            split_sizes = [out_dim // len(mapped)] * len(mapped)
+        elif None in split_sizes:
+            if size_tensor is None:
+                continue
+            if size_tensor.dim() <= split_dim:
+                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
+                continue
+            known = sum(size for size in split_sizes if size is not None)
+            none_count = split_sizes.count(None)
+            remaining = size_tensor.size(split_dim) - known
+            if remaining < 0 or remaining % none_count != 0:
+                _skip(f"{base}: cannot resolve split sizes")
+                continue
+            fill = remaining // none_count
+            split_sizes = [fill if size is None else size for size in split_sizes]
+
+        total = sum(split_sizes)
+        prefix = base[: -len(suffix)]
+        target_bases = [prefix + name for name in mapped]
+        added = 0
+
+        field_tensors = {
+            field: state_dict.get(base + "." + field)
+            for field in set(split_fields.keys()).union(share_fields)
+        }
+        base_ctx = {
+            "state_dict": state_dict,
+            "base": base,
+            "suffix": suffix,
+            "split_sizes": split_sizes,
+            "total": total,
+            "mapped": mapped,
+            "target_bases": target_bases,
+            "verboseLevel": verboseLevel,
+            "split_fields": split_fields,
+            "share_fields": share_fields,
+            "field_tensors": field_tensors,
+            "size_field": size_field,
+            "size_tensor": size_tensor,
+            "split_dim": split_dim,
+            "info": info,
+        }
+        fields_iter = list(split_fields.items()) + [(field, None) for field in share_fields]
+        for field, dim in fields_iter:
+            src = field_tensors.get(field)
+            if src is None:
+                continue
+            if dim is None:
+                for target_base in target_bases:
+                    dest_key = target_base + "." + field
+                    if dest_key not in state_dict:
+                        state_dict[dest_key] = src
+                        added += 1
+                continue
+            handler = _get_split_handler(info, field, split_handlers)
+            chunks = _call_split_handler(
+                handler,
+                src=src,
+                dim=dim,
+                split_sizes=split_sizes,
+                context=dict(base_ctx, field=field),
+            )
+            if chunks is None:
+                if src.dim() <= dim:
+                    _skip(f"{base}.{field}: dim={src.dim()} split_dim={dim}")
+                    continue
+                if src.size(dim) != total:
+                    _skip(f"{base}.{field}: size({dim})={src.size(dim)} expected={total}")
+                    continue
+                chunks = torch.split(src, split_sizes, dim=dim)
+            for target_base, chunk in zip(target_bases, chunks):
+                if torch.is_tensor(chunk) and not chunk.is_contiguous():
+                    chunk = chunk.contiguous()
+                dest_key = target_base + "." + field
+                if dest_key not in state_dict:
+                    state_dict[dest_key] = chunk
+                    added += 1
+
+        if added:
+            for field in list(split_fields.keys()) + list(share_fields):
+                state_dict.pop(base + "." + field, None)
+            split_bases.append(base)
+    if return_split_bases:
+        return state_dict, split_bases
+    return state_dict
+
+
+def split_linear_modules(model, map, split_handlers=None, share_fields=None):
+    from accelerate import init_empty_weights
+
+    split_handlers = split_handlers or {}
+    share_fields = share_fields or ()
+
+    modules_dict = { k: m for k, m in model.named_modules()}
+    for module_suffix, split_info in map.items():
+        mapped_modules = split_info["mapped_modules"]
+        split_sizes = split_info["split_sizes"]
+        split_share_fields = _merge_share_fields(split_info, share_fields)
+        split_dims = split_info.get("split_dims") or {}
+        for k, module in modules_dict.items():
+            if k.endswith("." + module_suffix):
+                parent_module = modules_dict[k[:len(k)-len(module_suffix)-1]]
+                weight = module.weight
+                bias = getattr(module, "bias", None)
+                if isinstance(module, QModuleMixin):
+                    out_features_total = weight.size(0)
+                    if sum(split_sizes) != out_features_total:
+                        raise ValueError(
+                            f"Split sizes {split_sizes} do not match out_features {out_features_total} for '{k}'."
+                        )
+                    in_features = weight.size(1)
+                    if bias is not None and bias.dim() > 0 and bias.size(0) == out_features_total:
+                        sub_biases = torch.split(bias, split_sizes, dim=0)
+                    else:
+                        sub_biases = [bias] * len(split_sizes)
+
+                    sub_tensors = _get_quantized_subtensors(weight)
+                    if not sub_tensors:
+                        raise ValueError(f"Unable to split quantized weight for '{k}'.")
+                    sub_maps = [dict() for _ in split_sizes]
+                    field_tensors = {name: tensor for name, tensor in sub_tensors}
+                    base_ctx = {
+                        "module": module,
+                        "module_name": k,
+                        "module_suffix": module_suffix,
+                        "mapped_modules": mapped_modules,
+                        "split_sizes": split_sizes,
+                        "out_features": out_features_total,
+                        "in_features": in_features,
+                        "field_tensors": field_tensors,
+                        "info": split_info,
+                    }
+                    for name, tensor in sub_tensors:
+                        if tensor is None or name in split_share_fields or tensor.dim() <= 1:
+                            _fill_sub_maps(sub_maps, name, tensor)
+                            continue
+                        split_dim = split_dims.get(name)
+                        if split_dim is None:
+                            if tensor.size(0) == out_features_total:
+                                split_dim = 0
+                            elif tensor.dim() > 1 and tensor.size(1) == out_features_total:
+                                split_dim = 1
+                            else:
+                                split_dim = 0
+                        handler = _get_split_handler(split_info, name, split_handlers)
+                        chunks = _call_split_handler(
+                            handler,
+                            src=tensor,
+                            dim=split_dim,
+                            split_sizes=split_sizes,
+                            context=dict(base_ctx, split_dim=split_dim),
+                        )
+                        if chunks is None:
+                            if tensor.dim() <= split_dim or tensor.size(split_dim) != out_features_total:
+                                got_size = "n/a" if tensor.dim() <= split_dim else tensor.size(split_dim)
+                                raise ValueError(
+                                    f"Cannot split '{k}' quantized tensor '{name}': "
+                                    f"expected size({split_dim})={out_features_total}, got {got_size}."
+                                )
+                            chunks = torch.split(tensor, split_sizes, dim=split_dim)
+                        for sub_map, chunk in zip(sub_maps, chunks):
+                            sub_map[name] = chunk
+
+                    create_fn = getattr(weight.__class__, "create", None)
+                    if not callable(create_fn):
+                        raise ValueError(f"Quantized weight class '{weight.__class__.__name__}' has no create()")
+                    create_sig = inspect.signature(create_fn)
+                    base_kwargs = {
+                        "qtype": getattr(weight, "qtype", None),
+                        "axis": getattr(weight, "axis", None),
+                        "stride": weight.stride(),
+                        "dtype": weight.dtype,
+                        "activation_qtype": getattr(weight, "activation_qtype", None),
+                        "requires_grad": weight.requires_grad,
+                        "group_size": getattr(weight, "_group_size", None),
+                        "device": weight.device,
+                    }
+
+                    qmodule_cls = module.__class__
+                    for sub_name, sub_size, sub_map, sub_bias in zip(
+                        mapped_modules, split_sizes, sub_maps, sub_biases
+                    ):
+                        with init_empty_weights():
+                            sub_module = qmodule_cls(
+                                in_features,
+                                sub_size,
+                                bias=bias is not None,
+                                device="cpu",
+                                dtype=weight.dtype,
+                                weights=module.weight_qtype,
+                                activations=module.activation_qtype,
+                                optimizer=module.optimizer,
+                                quantize_input=True,
+                            )
+                        size = list(weight.size())
+                        if size:
+                            size[0] = sub_size
+                        base_kwargs["size"] = tuple(size)
+                        create_kwargs = {}
+                        missing = []
+                        for name, param in create_sig.parameters.items():
+                            if name == "self":
+                                continue
+                            if name in sub_map:
+                                create_kwargs[name] = sub_map[name]
+                            elif name in base_kwargs and base_kwargs[name] is not None:
+                                create_kwargs[name] = base_kwargs[name]
+                            elif param.default is param.empty:
+                                missing.append(name)
+                        if missing:
+                            raise ValueError(
+                                f"Unable to rebuild quantized weight for '{k}.{sub_name}': "
+                                f"missing {missing}."
+                            )
+                        sub_weight = create_fn(**create_kwargs)
+                        sub_module.weight = torch.nn.Parameter(sub_weight, requires_grad=weight.requires_grad)
+                        if sub_bias is not None:
+                            sub_module.bias = torch.nn.Parameter(sub_bias)
+                        sub_module.optimizer = module.optimizer
+                        sub_module.weight_qtype = module.weight_qtype
+                        sub_module.activation_qtype = module.activation_qtype
+                        setattr(parent_module, sub_name, sub_module)
+                else:
+                    sub_data = torch.split(weight, split_sizes, dim=0)
+                    sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
+                    for sub_name, sub_weight, sub_biases in zip(mapped_modules, sub_data, sub_bias):
+                        sub_module = torch.nn.Linear(
+                            module.in_features,
+                            sub_weight.size(0),
+                            bias=bias is not None,
+                            device=weight.device,
+                            dtype=weight.dtype,
+                        )
+                        sub_module.weight = torch.nn.Parameter(sub_weight)
+                        if sub_biases is not None:
+                            sub_module.bias = torch.nn.Parameter(sub_biases)
+                        setattr(parent_module, sub_name, sub_module)
+                delattr(parent_module, module_suffix)
 
 
 def detect_safetensors_format(state_dict, verboseLevel=1):
@@ -561,6 +967,17 @@ def _infer_qtype_from_quantization_map(quantization_map):
     return best_key
 
 
+def load_metadata_state_dict(file_path):
+
+    if isinstance(file_path, str) and get_extension_handler(file_path) is not None:
+        ext_handler = get_extension_handler(file_path)
+        if hasattr(ext_handler, "get_file_metadata"):
+            return ext_handler.get_file_metadata(file_path)
+        else:
+            return {}, {}
+    state_dict, metadata = safetensors2.load_metadata_state_dict(file_path)
+    return state_dict, metadata
+
 def detect_quantization_kind_for_file(file_path, verboseLevel=1):
     cached = get_cached_quantization_for_file(file_path)
     if cached:
@@ -596,7 +1013,7 @@ def detect_quantization_kind_for_file(file_path, verboseLevel=1):
 
     metadata_only = False
     try:
-        state_dict, metadata = safetensors2.load_metadata_state_dict(file_path)
+        state_dict, metadata = load_metadata_state_dict(file_path)
         metadata_only = True
     except Exception:
         try:
@@ -642,6 +1059,148 @@ def detect_quantization_label_from_filename(filename):
     if "quanto" in base:
         return "QUANTO"
     return ""
+
+
+def _get_qtype_name_from_quant_map(entry):
+    if entry is None:
+        return ""
+    if isinstance(entry, dict):
+        entry = entry.get("weights")
+    return _normalize_kind_key(entry)
+
+
+def _build_qtype_handler_map():
+    mapping = {}
+    for handler in _load_handlers():
+        for qt in _extract_qtypes(handler):
+            name = getattr(qt, "name", None)
+            if isinstance(name, str) and name:
+                mapping.setdefault(name.lower(), handler)
+    return mapping
+
+
+def _collect_fused_bases(state_dict, fused_split_map):
+    if not fused_split_map or not state_dict:
+        return {}
+    suffixes = list(fused_split_map.keys())
+    if not suffixes:
+        return {}
+    bases = {}
+    for key in state_dict.keys():
+        if key.endswith(".weight"):
+            base = key[:-7]
+        elif key.endswith(".qweight"):
+            base = key[:-8]
+        else:
+            continue
+        for suffix in suffixes:
+            if base.endswith(suffix):
+                bases[base] = suffix
+                break
+    return bases
+
+
+def _remap_quantization_entries(quantization_map, base, targets):
+    if not quantization_map or not targets:
+        return
+    for suffix in ("", ".weight"):
+        key = base + suffix if suffix else base
+        if key not in quantization_map:
+            continue
+        cfg = quantization_map.pop(key)
+        for target in targets:
+            quantization_map[target + suffix] = cfg
+
+
+def split_fused_weights(state_dict, quantization_map, fused_split_map, default_dtype=None, verboseLevel=1):
+    if not fused_split_map or not state_dict:
+        return state_dict, quantization_map
+
+    quantization_map = quantization_map or {}
+    fused_bases = _collect_fused_bases(state_dict, fused_split_map)
+    if not fused_bases:
+        return state_dict, quantization_map
+
+    handler_map = _build_qtype_handler_map()
+    bases_info = {}
+    for base, suffix in fused_bases.items():
+        info = fused_split_map.get(suffix) or {}
+        mapped = info.get("mapped_modules") or info.get("mapped_suffixes") or info.get("mapped") or []
+        if not mapped:
+            continue
+        prefix = base[:-len(suffix)]
+        targets = [prefix + name for name in mapped]
+        qtype_name = _get_qtype_name_from_quant_map(quantization_map.get(base))
+        if not qtype_name:
+            qtype_name = _get_qtype_name_from_quant_map(quantization_map.get(base + ".weight"))
+        if not qtype_name:
+            weight = state_dict.get(base + ".weight")
+            if torch.is_tensor(weight) and getattr(weight, "tensor_type", None) is not None:
+                qtype_name = "gguf"
+        bases_info[base] = {
+            "suffix": suffix,
+            "targets": targets,
+            "qtype": qtype_name,
+        }
+
+    if not bases_info:
+        return state_dict, quantization_map
+
+    handler_bases = {}
+    for base, info in bases_info.items():
+        qtype_name = info["qtype"]
+        if not qtype_name:
+            continue
+        handler = handler_map.get(qtype_name)
+        if handler is None:
+            continue
+        if not callable(getattr(handler, "split_fused_weights", None)):
+            continue
+        handler_bases.setdefault(handler, set()).add(base)
+
+    handled_bases = set()
+    for handler, bases in handler_bases.items():
+        fn = getattr(handler, "split_fused_weights", None)
+        if not callable(fn):
+            continue
+        result = fn(
+            state_dict,
+            fused_split_map,
+            quantization_map=quantization_map,
+            allowed_bases=bases,
+            default_dtype=default_dtype,
+            verboseLevel=verboseLevel,
+        )
+        if isinstance(result, tuple) and len(result) == 2:
+            state_dict, split_bases = result
+        else:
+            state_dict = result or state_dict
+            split_bases = []
+        handled_bases.update(split_bases or [])
+
+    default_bases = [
+        base for base, info in bases_info.items()
+        if not info["qtype"] and base not in handled_bases
+    ]
+    if default_bases:
+        state_dict, split_bases = sd_split_linear(
+            state_dict,
+            fused_split_map,
+            split_fields={"weight": 0, "bias": 0},
+            verboseLevel=verboseLevel,
+            allowed_bases=default_bases,
+            return_split_bases=True,
+        )
+        handled_bases.update(split_bases or [])
+
+    if quantization_map and handled_bases:
+        for base in handled_bases:
+            info = bases_info.get(base)
+            if not info:
+                continue
+            _remap_quantization_entries(quantization_map, base, info["targets"])
+
+    return state_dict, quantization_map
 
 
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):

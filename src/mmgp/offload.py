@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.6.16 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.5 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -76,6 +76,11 @@ from .quant_router import (
     cache_quantization_for_file,
     detect_and_convert,
     detect_safetensors_format,
+    sd_split_linear,
+    split_linear_modules,
+    split_fused_weights,
+    get_extension_handler,
+    normalize_extension_path,
 )
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 # support for Embedding module quantization that is not supported by default by quanto
@@ -101,40 +106,34 @@ def cudacontext(device):
         return wrapper
     return decorator
 
+    return _orig_get_parameter_device(parameter)
+
+try:
+    import transformers.modeling_utils as mu # Transfomers v4
+    _orig_get_parameter_device = mu.get_parameter_device
+    def _patched_get_parameter_device(parameter):
+        forced = getattr(parameter, "_force_device", None)
+        if forced is not None:
+            return torch.device(forced)
+        return _orig_get_parameter_device(parameter)    
+    mu.get_parameter_device = _patched_get_parameter_device	
+except:
+    pass
+
+try:
+    import transformers.modeling_utils as mu # Transfomers v5
+    _orig_device = mu.ModuleUtilsMixin.device.fget
+    def _device(self):
+        forced = getattr(self, "_force_device", None)
+        if forced is not None:
+            return torch.device(forced)
+        return _orig_device(self)    
+    mu.ModuleUtilsMixin.device = property(_device)
+except:
+    pass
+
 
 shared_state = {}
-_FILE_EXTENSION_HANDLERS = {}
-
-
-def register_file_extension(extension, handler):
-    if not extension or handler is None:
-        return
-    ext = str(extension).lower()
-    if ext.startswith("."):
-        ext = ext[1:]
-    if not ext:
-        return
-    _FILE_EXTENSION_HANDLERS[ext] = handler
-
-
-def _get_extension_handler(file_path):
-    if not isinstance(file_path, str):
-        return None
-    ext = os.path.splitext(file_path)[1].lower().lstrip(".")
-    if not ext:
-        return None
-    return _FILE_EXTENSION_HANDLERS.get(ext)
-
-
-def _normalize_extension_path(file_path):
-    handler = _get_extension_handler(file_path)
-    if handler is None:
-        return file_path
-    normalizer = getattr(handler, "normalize", None)
-    if not callable(normalizer):
-        ext = os.path.splitext(file_path)[1].lower().lstrip(".")
-        raise Exception(f"Missing normalize for *.{ext} handler")
-    return normalizer(file_path)
 
 def get_cache(cache_name):
     all_cache = shared_state.get("_cache",  None)
@@ -347,14 +346,26 @@ def _safetensors_load_file(file_path, writable_tensors = True):
 
 def _force_load_buffer(p):
     # To do : check if buffer was persistent and transfer state, or maybe swap keep already this property ?
-    q = torch.nn.Buffer(p.clone())
+    q = _make_buffer(p.clone())
     torch.utils.swap_tensors(p, q)
     del q
 
 def _force_load_parameter(p):
-    q = torch.nn.Parameter(p.clone())
+    q = _make_parameter(p.clone(), requires_grad=p.requires_grad)
     torch.utils.swap_tensors(p, q)
     del q
+
+def _make_buffer(tensor):
+    if torch.is_inference_mode_enabled():
+        with torch.inference_mode(False):
+            return torch.nn.Buffer(tensor)
+    return torch.nn.Buffer(tensor)
+
+def _make_parameter(tensor, requires_grad=False):
+    if torch.is_inference_mode_enabled():
+        with torch.inference_mode(False):
+            return torch.nn.Parameter(tensor, requires_grad=requires_grad)
+    return torch.nn.Parameter(tensor, requires_grad=requires_grad)
 
 def _unwrap_quantized_tensor(tensor):
     if hasattr(tensor, "_data") and torch.is_tensor(tensor._data):
@@ -478,11 +489,12 @@ def _extract_tie_weights_from_sd(sd , sd_name, verboseLevel =1):
             length = torch.numel(p.data) * p.data.element_size() 
             ref_cache[ref] = (n, length)
         
-    if verboseLevel >=1 and tied_weights_count > 0:
-        if  tied_weights_count == 1:
+    if verboseLevel >=2 and tied_weights_count > 0:
+        if tied_weights_count == 1:
             print(f"Tied weights of {tied_weights_total/ONE_MB:0.2f} MB detected: {tied_weights_last}")
         else:
             print(f"Found {tied_weights_count} tied weights for a total of {tied_weights_total/ONE_MB:0.2f} MB, last : {tied_weights_last}")
+    return tied_weights
 
 def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TENSOR_MAX_SIZE, verboseLevel = 1):
     global max_pinnable_bytes, total_pinned_bytes
@@ -509,8 +521,8 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
         new_tied_weights = {}
         for i, sub_tied_weights,  in enumerate(tied_weights):
             for k, v in sub_tied_weights.items():
-                new_tied_weights[str(i) + "#" + k] =v
-        sd = new_tied_weights
+                new_tied_weights[str(i) + "#" + k] = str(i) + "#" + v
+        tied_weights = new_tied_weights
         del new_tied_weights
         sub_tied_weights = None
 
@@ -814,7 +826,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.6.16) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.5) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1041,7 +1053,10 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
         exclude_list = None
 
 
-    exclude_list += list(tied_weights) 
+    if exclude_list is None:
+        exclude_list = list(tied_weights)
+    else:
+        exclude_list += list(tied_weights)
     quantize(model_to_quantize, weights= weights, exclude= exclude_list)
 
 
@@ -1105,348 +1120,6 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
     print(f"Quantization of model '{model_id}' done")
 
     return True
-
-def _as_field_tuple(value):
-    if not value:
-        return ()
-    if isinstance(value, str):
-        return (value,)
-    return tuple(value)
-
-
-def _get_split_handler(info, field, default_handlers):
-    handlers = info.get("split_handlers") or info.get("field_handlers") or {}
-    if handlers:
-        handler = handlers.get(field)
-        if handler is not None:
-            return handler
-    if default_handlers:
-        return default_handlers.get(field)
-    return None
-
-
-def _get_split_base_fields(info, split_fields):
-    base_fields = _as_field_tuple(info.get("base_fields") or info.get("base_field"))
-    if base_fields:
-        return base_fields
-    if split_fields:
-        return (next(iter(split_fields.keys())),)
-    return ()
-
-
-def _merge_share_fields(info, share_fields):
-    info_fields = _as_field_tuple(info.get("share_fields") or info.get("shared_fields"))
-    return tuple(sorted(set(info_fields).union(_as_field_tuple(share_fields))))
-
-
-def _call_split_handler(handler, *, src, dim, split_sizes, context):
-    if handler is None:
-        return None
-    try:
-        chunks = handler(src=src, dim=dim, split_sizes=split_sizes, context=context)
-    except Exception:
-        return None
-    if not isinstance(chunks, (list, tuple)) or len(chunks) != len(split_sizes):
-        return None
-    return chunks
-
-
-def _fill_sub_maps(sub_maps, name, value):
-    for sub_map in sub_maps:
-        sub_map[name] = value
-
-
-def sd_split_linear(
-    state_dict,
-    split_map,
-    split_fields=None,
-    share_fields=None,
-    verboseLevel=1,
-    split_handlers=None,
-):
-    if not split_map:
-        return state_dict
-    split_fields = split_fields or {}
-    share_fields = share_fields or ()
-    split_handlers = split_handlers or {}
-    base_fields_by_suffix = {
-        suffix: _get_split_base_fields(info or {}, split_fields)
-        for suffix, info in split_map.items()
-    }
-    def _skip(msg):
-        pass
-
-    bases = {}
-    for key in state_dict.keys():
-        for suffix, base_fields in base_fields_by_suffix.items():
-            for base_field in base_fields:
-                suffix_token = f"{suffix}.{base_field}"
-                if not key.endswith(suffix_token):
-                    continue
-                base = key[: -len("." + base_field)]
-                if base.endswith(suffix):
-                    bases[base] = suffix
-                break
-
-    if not bases:
-        return state_dict
-
-    for base, suffix in bases.items():
-        info = split_map.get(suffix) or {}
-        mapped = info.get("mapped_modules") or info.get("mapped_suffixes") or info.get("mapped") or []
-        if not mapped:
-            continue
-
-        base_fields = base_fields_by_suffix.get(suffix) or _get_split_base_fields(info, split_fields)
-        size_field = info.get("size_field") or (base_fields[0] if base_fields else None)
-        size_tensor = state_dict.get(base + "." + size_field) if size_field else None
-        split_dim = info.get("split_dim", 0)
-        split_sizes = list(info.get("split_sizes") or [])
-        if not split_sizes:
-            if size_tensor is None:
-                continue
-            if size_tensor.dim() <= split_dim:
-                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
-                continue
-            out_dim = size_tensor.size(split_dim)
-            if out_dim % len(mapped) != 0:
-                _skip(f"{base}: out_dim={out_dim} not divisible by {len(mapped)}")
-                continue
-            split_sizes = [out_dim // len(mapped)] * len(mapped)
-        elif None in split_sizes:
-            if size_tensor is None:
-                continue
-            if size_tensor.dim() <= split_dim:
-                _skip(f"{base}: dim={size_tensor.dim()} split_dim={split_dim}")
-                continue
-            known = sum(size for size in split_sizes if size is not None)
-            none_count = split_sizes.count(None)
-            remaining = size_tensor.size(split_dim) - known
-            if remaining < 0 or remaining % none_count != 0:
-                _skip(f"{base}: cannot resolve split sizes")
-                continue
-            fill = remaining // none_count
-            split_sizes = [fill if size is None else size for size in split_sizes]
-
-        total = sum(split_sizes)
-        prefix = base[: -len(suffix)]
-        target_bases = [prefix + name for name in mapped]
-        added = 0
-
-        field_tensors = {
-            field: state_dict.get(base + "." + field)
-            for field in set(split_fields.keys()).union(share_fields)
-        }
-        base_ctx = {
-            "state_dict": state_dict,
-            "base": base,
-            "suffix": suffix,
-            "split_sizes": split_sizes,
-            "total": total,
-            "mapped": mapped,
-            "target_bases": target_bases,
-            "verboseLevel": verboseLevel,
-            "split_fields": split_fields,
-            "share_fields": share_fields,
-            "field_tensors": field_tensors,
-            "size_field": size_field,
-            "size_tensor": size_tensor,
-            "split_dim": split_dim,
-            "info": info,
-        }
-        fields_iter = list(split_fields.items()) + [(field, None) for field in share_fields]
-        for field, dim in fields_iter:
-            src = field_tensors.get(field)
-            if src is None:
-                continue
-            if dim is None:
-                for target_base in target_bases:
-                    dest_key = target_base + "." + field
-                    if dest_key not in state_dict:
-                        state_dict[dest_key] = src
-                        added += 1
-                continue
-            if src.dim() <= dim:
-                _skip(f"{base}.{field}: dim={src.dim()} split_dim={dim}")
-                continue
-            if src.size(dim) != total:
-                _skip(f"{base}.{field}: size({dim})={src.size(dim)} expected={total}")
-                continue
-            handler = _get_split_handler(info, field, split_handlers)
-            chunks = _call_split_handler(
-                handler,
-                src=src,
-                dim=dim,
-                split_sizes=split_sizes,
-                context=dict(base_ctx, field=field),
-            )
-            if chunks is None:
-                chunks = torch.split(src, split_sizes, dim=dim)
-            for target_base, chunk in zip(target_bases, chunks):
-                if torch.is_tensor(chunk) and not chunk.is_contiguous():
-                    chunk = chunk.contiguous()
-                dest_key = target_base + "." + field
-                if dest_key not in state_dict:
-                    state_dict[dest_key] = chunk
-                    added += 1
-
-        if added:
-            for field in list(split_fields.keys()) + list(share_fields):
-                state_dict.pop(base + "." + field, None)
-    return state_dict
-
-
-def split_linear_modules(model, map, split_handlers=None, share_fields=None):
-    from optimum.quanto import QModuleMixin
-    from accelerate import init_empty_weights
-
-    split_handlers = split_handlers or {}
-    share_fields = share_fields or ()
-
-    modules_dict = { k: m for k, m in model.named_modules()}
-    for module_suffix, split_info in map.items():
-        mapped_modules = split_info["mapped_modules"]
-        split_sizes = split_info["split_sizes"]
-        split_share_fields = _merge_share_fields(split_info, share_fields)
-        split_dims = split_info.get("split_dims") or {}
-        for k, module in modules_dict.items():
-            if k.endswith("." + module_suffix):
-                parent_module = modules_dict[k[:len(k)-len(module_suffix)-1]]
-                weight = module.weight
-                bias = getattr(module, "bias", None) 
-                if isinstance(module, QModuleMixin):
-                    out_features_total = weight.size(0)
-                    if sum(split_sizes) != out_features_total:
-                        raise ValueError(
-                            f"Split sizes {split_sizes} do not match out_features {out_features_total} for '{k}'."
-                        )
-                    in_features = weight.size(1)
-                    sub_biases = None
-                    if bias is not None and bias.dim() > 0 and bias.size(0) == out_features_total:
-                        sub_biases = torch.split(bias, split_sizes, dim=0)
-                    else:
-                        sub_biases = [bias] * len(split_sizes)
-
-                    sub_tensors = _get_quantized_subtensors(weight)
-                    if not sub_tensors:
-                        raise ValueError(f"Unable to split quantized weight for '{k}'.")
-                    sub_maps = [dict() for _ in split_sizes]
-                    field_tensors = {name: tensor for name, tensor in sub_tensors}
-                    base_ctx = {
-                        "module": module,
-                        "module_name": k,
-                        "module_suffix": module_suffix,
-                        "mapped_modules": mapped_modules,
-                        "split_sizes": split_sizes,
-                        "out_features": out_features_total,
-                        "in_features": in_features,
-                        "field_tensors": field_tensors,
-                        "info": split_info,
-                    }
-                    for name, tensor in sub_tensors:
-                        if tensor is None or name in split_share_fields or tensor.dim() <= 1:
-                            _fill_sub_maps(sub_maps, name, tensor)
-                            continue
-                        split_dim = split_dims.get(name)
-                        if split_dim is None:
-                            if tensor.size(0) == out_features_total:
-                                split_dim = 0
-                            elif tensor.dim() > 1 and tensor.size(1) == out_features_total:
-                                split_dim = 1
-                            else:
-                                split_dim = 0
-                        handler = _get_split_handler(split_info, name, split_handlers)
-                        chunks = _call_split_handler(
-                            handler,
-                            src=tensor,
-                            dim=split_dim,
-                            split_sizes=split_sizes,
-                            context=dict(base_ctx, split_dim=split_dim),
-                        )
-                        if chunks is None:
-                            if tensor.dim() <= split_dim or tensor.size(split_dim) != out_features_total:
-                                got_size = "n/a" if tensor.dim() <= split_dim else tensor.size(split_dim)
-                                raise ValueError(
-                                    f"Cannot split '{k}' quantized tensor '{name}': "
-                                    f"expected size({split_dim})={out_features_total}, got {got_size}."
-                                )
-                            chunks = torch.split(tensor, split_sizes, dim=split_dim)
-                        for sub_map, chunk in zip(sub_maps, chunks):
-                            sub_map[name] = chunk
-
-                    create_fn = getattr(weight.__class__, "create", None)
-                    if not callable(create_fn):
-                        raise ValueError(f"Quantized weight class '{weight.__class__.__name__}' has no create()")
-                    create_sig = inspect.signature(create_fn)
-                    base_kwargs = {
-                        "qtype": getattr(weight, "qtype", None),
-                        "axis": getattr(weight, "axis", None),
-                        "stride": weight.stride(),
-                        "dtype": weight.dtype,
-                        "activation_qtype": getattr(weight, "activation_qtype", None),
-                        "requires_grad": weight.requires_grad,
-                        "group_size": getattr(weight, "_group_size", None),
-                        "device": weight.device,
-                    }
-
-                    qmodule_cls = module.__class__
-                    for sub_name, sub_size, sub_map, sub_bias in zip(
-                        mapped_modules, split_sizes, sub_maps, sub_biases
-                    ):
-                        with init_empty_weights():
-                            sub_module = qmodule_cls(
-                                in_features,
-                                sub_size,
-                                bias=bias is not None,
-                                device="cpu",
-                                dtype=weight.dtype,
-                                weights=module.weight_qtype,
-                                activations=module.activation_qtype,
-                                optimizer=module.optimizer,
-                                quantize_input=True,
-                            )
-                        size = list(weight.size())
-                        if size:
-                            size[0] = sub_size
-                        base_kwargs["size"] = tuple(size)
-                        create_kwargs = {}
-                        missing = []
-                        for name, param in create_sig.parameters.items():
-                            if name == "self":
-                                continue
-                            if name in sub_map:
-                                create_kwargs[name] = sub_map[name]
-                            elif name in base_kwargs and base_kwargs[name] is not None:
-                                create_kwargs[name] = base_kwargs[name]
-                            elif param.default is param.empty:
-                                missing.append(name)
-                        if missing:
-                            raise ValueError(
-                                f"Unable to rebuild quantized weight for '{k}.{sub_name}': "
-                                f"missing {missing}."
-                            )
-                        sub_weight = create_fn(**create_kwargs)
-                        sub_module.weight = torch.nn.Parameter(sub_weight, requires_grad=weight.requires_grad)
-                        if sub_bias is not None:
-                            sub_module.bias = torch.nn.Parameter(sub_bias)
-                        sub_module.optimizer = module.optimizer
-                        sub_module.weight_qtype = module.weight_qtype
-                        sub_module.activation_qtype = module.activation_qtype
-                        setattr(parent_module, sub_name, sub_module)
-                else:
-                    sub_data = torch.split(weight, split_sizes, dim=0)
-                    sub_bias = torch.split(bias, split_sizes, dim=0) if bias is not None else [None] * len(split_sizes)
-                    for sub_name, subdata, subbias in zip(mapped_modules, sub_data, sub_bias):
-                        with init_empty_weights():
-                            sub_module = torch.nn.Linear( subdata.shape[1], subdata.shape[0], bias=bias != None, device ="cpu", dtype=weight.dtype)
-                        sub_module.weight = torch.nn.Parameter(subdata , requires_grad=False)
-                        if bias != None:
-                            sub_module.bias = torch.nn.Parameter(subbias)
-                        setattr(parent_module, sub_name, sub_module)
-
-                delattr(parent_module, module_suffix)
-
-
 def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_loras = True, check_only = False, ignore_model_variations = False, pinnedLora = False, maxReservedLoras = -1, split_linear_modules_map = None, preprocess_sd = None, verboseLevel = -1,):
     verboseLevel = _compute_verbose_level(verboseLevel)
 
@@ -1490,6 +1163,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
         unload_loras_from_model(model)
 
     modules_dict = {k: v for k,v in model.named_modules()}
+    module_names = {v: k for k, v in modules_dict.items()}
 
     CrLf = '\r\n'
     error_msg = ""
@@ -1513,6 +1187,113 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                 total_bytes += v.numel() * v.element_size()
         return total_bytes / (1024 * 1024)
 
+    def _split_lokr_output_sizes(split_sizes, w1, w2):
+        if w1 is None or w2 is None:
+            return None
+        rows2 = int(w2.shape[0])
+        if rows2 <= 0:
+            return None
+        out_rows = int(w1.shape[0]) * rows2
+        if sum(split_sizes) != out_rows:
+            return None
+        reduced = []
+        for sz in split_sizes:
+            if sz % rows2 != 0:
+                return None
+            reduced.append(sz // rows2)
+        if sum(reduced) != int(w1.shape[0]):
+            return None
+        return reduced
+
+    def _split_lokr_chunked_if_needed(parent_prefix, mapped_modules, split_sizes, w1, w2, new_state_dict, lokr_split_chunks):
+        if w1 is None or w2 is None:
+            return False
+        out_rows = int(w1.shape[0]) * int(w2.shape[0])
+        if sum(split_sizes) != out_rows:
+            return False
+        start = 0
+        for sub_name, sub_size in zip(mapped_modules, split_sizes):
+            target_base = parent_prefix + sub_name
+            if target_base + ".lokr_w1" not in new_state_dict:
+                new_state_dict[target_base + ".lokr_w1"] = w1
+            if target_base + ".lokr_w2" not in new_state_dict:
+                new_state_dict[target_base + ".lokr_w2"] = w2
+            lokr_split_chunks[target_base] = (start, start + sub_size)
+            start += sub_size
+        return True
+
+    def _split_lokr_key(module_name, module_data, state_dict, new_state_dict, lokr_split_chunks):
+        name_parts = module_name.split(".")
+        if len(name_parts) < 2:
+            return module_name
+        split_map = split_linear_modules_map.get(name_parts[-2], None)
+        if split_map is None:
+            return module_name
+        mapped_modules = split_map.get("mapped_modules", None)
+        split_sizes = split_map.get("split_sizes", None)
+        if not mapped_modules or not split_sizes:
+            return module_name
+
+        parent_module_name = ".".join(name_parts[:-1])
+        is_w1 = module_name.endswith(".lokr_w1")
+        sibling_suffix = ".lokr_w2" if is_w1 else ".lokr_w1"
+        sibling_tensor = state_dict.get(parent_module_name + sibling_suffix, None)
+        w1 = module_data if is_w1 else sibling_tensor
+        w2 = sibling_tensor if is_w1 else module_data
+        reduced_split = _split_lokr_output_sizes(split_sizes, w1, w2)
+        parent_prefix = parent_module_name[:-len(name_parts[-2])]
+        if reduced_split is None:
+            if _split_lokr_chunked_if_needed(parent_prefix, mapped_modules, split_sizes, w1, w2, new_state_dict, lokr_split_chunks):
+                return None
+            return module_name
+
+        if is_w1:
+            chunks = torch.split(module_data, reduced_split, dim=0)
+            suffix = ".lokr_w1"
+        else:
+            chunks = [module_data] * len(mapped_modules)
+            suffix = ".lokr_w2"
+        for sub_name, sub_data in zip(mapped_modules, chunks):
+            new_state_dict[parent_prefix + sub_name + suffix] = sub_data
+        return None
+
+    def _build_lokr_chunk_specs(chunk, m2):
+        start, end = int(chunk[0]), int(chunk[1])
+        if end <= start or m2 <= 0:
+            return []
+        s_row, s_col = divmod(start, m2)
+        e_row, e_col = divmod(end, m2)
+        if s_row == e_row:
+            return [(s_row, s_row + 1, s_col, e_col)]
+
+        specs = []
+        mid_start_row = s_row
+        if s_col > 0:
+            specs.append((s_row, s_row + 1, s_col, m2))
+            mid_start_row += 1
+        if mid_start_row <= e_row - 1:
+            specs.append((mid_start_row, e_row, 0, m2))
+        if e_col > 0:
+            specs.append((e_row, e_row + 1, 0, e_col))
+        return specs
+
+    def _ensure_adapter_meta(loras_module_data, adapter_name):
+        data = loras_module_data.get(adapter_name, None)
+        if data is None:
+            data = [None, None, None, None, 1., {}]
+            loras_module_data[adapter_name] = data
+        return data, data[5] 
+
+    def _to_dtype_cached(tensor, dtype, cast_cache):
+        if tensor is None or tensor.dtype == dtype:
+            return tensor
+        key = (_get_tensor_ref(tensor), dtype)
+        cached = cast_cache.get(key, None)
+        if cached is None:
+            cached = tensor.to(dtype)
+            cast_cache[key] = cached
+        return cached
+
     if not isinstance(lora_path, list):
         lora_path = [lora_path]
     
@@ -1533,6 +1314,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     adapter_no = 0
     pinned_sd_list = []
     pinned_names_list = []
+    pinned_tied_weights_list = []
     for i, path in enumerate(lora_path):
         adapter_name = str(adapter_no)
         error_msg = ""
@@ -1543,41 +1325,23 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             continue
         fail = False
         skip = False
+        tied_weights = None
         state_dict = safetensors2.torch_load_file(path, writable_tensors= False)
 
         if preprocess_sd != None:
             state_dict = preprocess_sd(state_dict)
 
-        if split_linear_modules_map != None:
-            new_state_dict = dict()
-            suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False), (".lora_up.weight", -3, True), (".lora_down.weight", -3, False),(".dora_scale", -2, False),]
-            for module_name, module_data in state_dict.items():
-                name_parts = module_name.split(".")
-                for suffix, pos, any_split in suffixes: 
-                    if module_name.endswith(suffix) and (map := split_linear_modules_map.get(name_parts[pos], None )) != None:
-                        parent_module_name, module_name = ".".join(name_parts[:pos]), None
-                        sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else [None] * len(map["mapped_modules"])  
-                        for sub_name, subdata in zip(map["mapped_modules"], sub_data):
-                            new_module_name = parent_module_name + "." + sub_name + suffix
-                            new_state_dict[new_module_name] = subdata if any_split else module_data
-                        break
-                if module_name != None: new_state_dict[module_name] = module_data            
-            state_dict = new_state_dict
-            del new_state_dict
-            # tied_weights = _extract_tie_weights_from_sd(state_dict, path) # to do
-
         clean_up = False
         first_key = next(iter(state_dict), None)
-        if first_key == None:
+        if first_key is  None:
             msg = f"Empty Lora '{path}'"
             error_msg = append(error_msg, msg) 
             fail = True
-
-        if not fail:
+        else:
+            prefixes = ("diffusion_model.", "transformer.")
             pos = first_key.find(".")
             prefix = first_key[0:pos+1]
-            if prefix in ["diffusion_model.", "transformer."]:
-                prefixes = ("diffusion_model.", "transformer.")
+            if prefix in prefixes:
                 new_state_dict = {}
                 for k, v in state_dict.items():
                     for candidate in prefixes:
@@ -1586,10 +1350,35 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             break
                     new_state_dict[k] = v
                 state_dict = new_state_dict
+                del new_state_dict
 
+        if not fail:
+            lokr_split_chunks = {}
+            if split_linear_modules_map != None:
+                new_state_dict = {}
+                suffixes = [(".alpha", -2, False), (".lora_B.weight", -3, True), (".lora_A.weight", -3, False), (".lora_up.weight", -3, True), (".lora_down.weight", -3, False),(".dora_scale", -2, False),]
+                for module_name, module_data in state_dict.items():
+                    if module_name.endswith(".lokr_w1") or module_name.endswith(".lokr_w2"):
+                        module_name = _split_lokr_key(module_name, module_data, state_dict, new_state_dict, lokr_split_chunks)
+                        if module_name is not None: new_state_dict[module_name] = module_data
+                    else:
+                        name_parts = module_name.split(".")
+                        for suffix, pos, any_split in suffixes:
+                            if not module_name.endswith(suffix) or (map := split_linear_modules_map.get(name_parts[pos], None)) is None:
+                                continue
+                            parent_module_name = ".".join(name_parts[:pos])
+                            sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else (module_data,) * len(map["mapped_modules"])
+                            for sub_name, subdata in zip(map["mapped_modules"], sub_data):
+                                new_state_dict[parent_module_name + "." + sub_name + suffix] = subdata
+                            break
+                        else:
+                            new_state_dict[module_name] = module_data
+                state_dict = new_state_dict
+                del new_state_dict
             clean_up = True
 
             keys = list(state_dict.keys())
+            dtype_cast_cache = {}
 
             lora_alphas = {}
             for k in keys:
@@ -1602,18 +1391,32 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             invalid_keys = []
             unexpected_keys = []
             new_state_dict = {}
+            dora_found = False
+            lokr_found = False
             for k in list(state_dict.keys()):
                 v = state_dict.pop(k)
-                lora_A = lora_B = diff_b = diff = lora_key = dora_scale = None
+                lora_A = lora_B = diff_b = diff = lora_key = dora_scale = lokr_w1 = lokr_w2 = None
+                adapter_type = "lora"
                 if k.endswith(".diff"):
                     diff = v
                     module_name = k[ : -5]
+                    adapter_type = "diff"
                 elif k.endswith(".diff_b"):
                     diff_b = v
                     module_name = k[ : -7]
+                    adapter_type = "lora"
                 elif k.endswith(".dora_scale"):
                     dora_scale = v
                     module_name = k[ : -11]
+                    adapter_type = "dora"
+                elif k.endswith(".lokr_w1"):
+                    lokr_w1 = v
+                    module_name = k[ : -8]
+                    adapter_type = "lokr"
+                elif k.endswith(".lokr_w2"):
+                    lokr_w2 = v
+                    module_name = k[ : -8]
+                    adapter_type = "lokr"
                 else:
                     pos = k.rfind(".lora_")
                     if pos <=0:
@@ -1633,11 +1436,6 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                 if module == None:
                     unexpected_keys.append(k)
                     continue
-                if False: #not isinstance(module, (QLinear, torch.nn.Linear, torch.nn.Conv3d, torch.nn.LayerNorm)):
-                    msg = f"Lora '{path}' contains a non supported type of layer '{k}'"
-                    error_msg = append(error_msg, msg) 
-                    fail = True
-                    break
                 module_shape = module.weight.shape
                 rank = None
                 if lora_A != None:
@@ -1650,7 +1448,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
-                    v = lora_A = lora_A.to(module.weight.dtype)                     
+                    v = lora_A = _to_dtype_cached(lora_A, module.weight.dtype, dtype_cast_cache)
                 elif lora_B != None:
                     rank = lora_B.shape[1] 
                     if module_shape[0] != v.shape[0]:
@@ -1661,7 +1459,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
-                    v = lora_B = lora_B.to(module.weight.dtype)                     
+                    v = lora_B = _to_dtype_cached(lora_B, module.weight.dtype, dtype_cast_cache)
                 elif diff != None:
                     lora_B = diff
                     if module_shape != v.shape:
@@ -1672,7 +1470,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
-                    v = lora_B = lora_B.to(module.weight.dtype)                     
+                    v = lora_B = _to_dtype_cached(lora_B, module.weight.dtype, dtype_cast_cache)
                 elif diff_b != None:
                     rank = diff_b.shape[0] 
                     if not hasattr(module, "bias"):
@@ -1691,7 +1489,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                                 error_msg = append(error_msg, msg) 
                                 fail = True
                             break
-                    v = diff_b = diff_b.to(module.weight.dtype)                     
+                    v = diff_b = _to_dtype_cached(diff_b, module.weight.dtype, dtype_cast_cache)
                 elif dora_scale != None:
                     rank = dora_scale.shape[1] 
                     if module_shape[0] != v.shape[0]:
@@ -1702,31 +1500,73 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             error_msg = append(error_msg, msg) 
                             fail = True
                         break
-                    v = dora_scale = dora_scale.to(module.weight.dtype)                     
+                    v = dora_scale = _to_dtype_cached(dora_scale, module.weight.dtype, dtype_cast_cache)
+                elif lokr_w1 is not None:
+                    out_dim, in_dim = int(module_shape[0]), int(module_shape[1])
+                    m1, n1 = int(lokr_w1.shape[0]), int(lokr_w1.shape[1])
+                    lokr_chunk = lokr_split_chunks.get(module_name, None) 
+                    if lokr_chunk is None:
+                        invalid = m1 <= 0 or n1 <= 0 or out_dim % m1 != 0 or in_dim % n1 != 0
+                    else:
+                        invalid = m1 <= 0 or n1 <= 0 or (lokr_chunk[1] - lokr_chunk[0]) != out_dim or in_dim % n1 != 0
+                    if invalid:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}/{module_name}': LoKr W1 dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape}, lokr_w1 = {v.shape})."
+                            error_msg = append(error_msg, msg)
+                            fail = True
+                        break
+                    v = lokr_w1 = _to_dtype_cached(lokr_w1, module.weight.dtype, dtype_cast_cache)
+                elif lokr_w2 is not None:
+                    out_dim, in_dim = int(module_shape[0]), int(module_shape[1])
+                    m2, n2 = int(lokr_w2.shape[0]), int(lokr_w2.shape[1])
+                    lokr_chunk = lokr_split_chunks.get(module_name, None) 
+                    if lokr_chunk is None:
+                        invalid = m2 <= 0 or n2 <= 0 or out_dim % m2 != 0 or in_dim % n2 != 0
+                    else:
+                        invalid = m2 <= 0 or n2 <= 0 or (lokr_chunk[1] - lokr_chunk[0]) != out_dim or in_dim % n2 != 0
+                    if invalid:
+                        if ignore_model_variations:
+                            skip = True
+                        else:
+                            msg = f"Lora '{path}/{module_name}': LoKr W2 dimension is not compatible with model '{_get_module_name(model)}' (model = {module_shape}, lokr_w2 = {v.shape})."
+                            error_msg = append(error_msg, msg)
+                            fail = True
+                        break
+                    v = lokr_w2 = _to_dtype_cached(lokr_w2, module.weight.dtype, dtype_cast_cache)
                 if not check_only:
                     new_state_dict[k] = v
                     v = None
                     loras_module_data = loras_model_data.get(module, None)
-                    assert loras_module_data != None
-                    loras_adapter_data =  loras_module_data.get(adapter_name, None)
-                    if loras_adapter_data == None:
-                        loras_adapter_data = [None, None, None, None, 1.]
-                        module.any_dora = False
-                        loras_module_data[adapter_name] = loras_adapter_data
+                    assert loras_module_data is not None
+                    loras_adapter_data, meta = _ensure_adapter_meta(loras_module_data, adapter_name)
+                    if adapter_type in ("dora", "lokr", "diff"):
+                        meta["type"] = adapter_type
+                    elif "type" not in meta:
+                        meta["type"] = "lora"
+                    if adapter_type == "lokr":
+                        lokr_found = True
+                        if lokr_chunk is not None: meta["lokr_chunk"] = lokr_chunk
+                    elif adapter_type == "dora":
+                        dora_found = True
                     if lora_A != None:
                         loras_adapter_data[0] = lora_A
                     elif lora_B != None:
                         loras_adapter_data[1] = lora_B 
                     elif dora_scale != None:
                         loras_adapter_data[3] = dora_scale 
-                        loras_module_data["any_dora"] = True
+                    elif lokr_w1 is not None:
+                        loras_adapter_data[0] = lokr_w1
+                    elif lokr_w2 is not None:
+                        loras_adapter_data[1] = lokr_w2
                     else:
                         loras_adapter_data[2] = diff_b 
                     if rank != None and lora_key is not None and "lora" in lora_key:
                         alpha_key = k[:-len(lora_key)] + "alpha"
                         alpha = lora_alphas.get(alpha_key, None)
                         if alpha is not None: loras_adapter_data[4] = alpha / rank 
-            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = dora_scale = None
+            lora_A = lora_B = diff = diff_b = v = loras_module_data = loras_adapter_data = lora_alphas = dora_scale = lokr_w1 = lokr_w2 = dtype_cast_cache = None
 
             if len(invalid_keys)  > 0:
                 msg = f"Lora '{path}' contains non Lora keys '{trunc(invalid_keys,200)}'"
@@ -1736,12 +1576,59 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                 msg = f"Lora '{path}' contains unexpected module keys, it is likely that this Lora is for a different model : '{trunc(unexpected_keys,200)}'"
                 error_msg = append(error_msg, msg) 
                 fail = True
+            if (not fail) and (not check_only) and dora_found and lokr_found:
+                msg = f"Lora '{path}': LoKr cannot be mixed with DoRA on the same module."
+                error_msg = append(error_msg, msg)
+                fail = True
+            if (not fail) and lokr_found:
+                for module, loras_module_data in loras_model_data.items():
+                    if adapter_name not in loras_module_data: continue
+                    loras_adapter_data, meta = _ensure_adapter_meta(loras_module_data, adapter_name)
+                    adapter_type = meta.get("type", "lora")
+                    if adapter_type != "lokr": continue
+                    w1, w2 = loras_adapter_data[0], loras_adapter_data[1]
+                    if w1 is not None and w2 is not None:
+                        lokr_chunk = meta.get("lokr_chunk", None)
+                        effective_chunk = lokr_chunk if lokr_chunk is not None else (0, int(w1.shape[0]) * int(w2.shape[0]))
+                        meta["lokr_specs"] = _build_lokr_chunk_specs(effective_chunk, int(w2.shape[0]))
+                        module_shape = module.weight.shape
+                        if lokr_chunk is None:
+                            invalid = int(module_shape[0]) != int(w1.shape[0]) * int(w2.shape[0]) or int(module_shape[1]) != int(w1.shape[1]) * int(w2.shape[1])
+                        else:
+                            invalid = int(module_shape[0]) != (lokr_chunk[1] - lokr_chunk[0]) or int(module_shape[1]) != int(w1.shape[1]) * int(w2.shape[1])
+                        if invalid:
+                            module_name = module_names.get(module, type(module).__name__)
+                            msg = f"Lora '{path}/{module_name}': LoKr factors are not compatible with model shape (model = {module_shape}, lokr_w1 = {tuple(w1.shape)}, lokr_w2 = {tuple(w2.shape)})."
+                            error_msg = append(error_msg, msg)
+                            fail = True
+                            break
+            if (not fail) and (not check_only):
+                alias_owners = {}
+                for module, loras_module_data in loras_model_data.items():
+                    loras_adapter_data = loras_module_data.get(adapter_name, None)
+                    if loras_adapter_data is None:
+                        continue
+                    module_name = module_names.get(module, None)
+                    if module_name is None:
+                        continue
+                    for slot in range(min(4, len(loras_adapter_data))):
+                        tensor = loras_adapter_data[slot]
+                        if not torch.is_tensor(tensor):
+                            continue
+                        key = (slot, _get_tensor_ref(tensor))
+                        owner_name = alias_owners.get(key, None)
+                        if owner_name is None:
+                            alias_owners[key] = module_name
+                        else:
+                            loras_adapter_data[slot] = owner_name + "#" + str(slot)
+            if (not fail) and (not check_only) and pinnedLora:
+                tied_weights = _extract_tie_weights_from_sd(new_state_dict, path, verboseLevel=max(0, verboseLevel))
         if fail or skip:
             if fail:
                 errors.append((path, error_msg))
                 print(error_msg)
             if clean_up and not check_only:
-                for m,loras_module_data in loras_model_data.items():
+                for _, loras_module_data in loras_model_data.items():
                     if adapter_name in loras_module_data:
                         del loras_module_data[adapter_name]
 
@@ -1752,13 +1639,14 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                     if max_reserved_loras_mb < 0:
                         pinned_sd_list.append(new_state_dict)
                         pinned_names_list.append(path)
+                        pinned_tied_weights_list.append(tied_weights)
                     else:
                         lora_size_mb = _state_dict_size_mb(new_state_dict)
                         if pinned_total_mb + lora_size_mb <= max_reserved_loras_mb:
                             pinned_sd_list.append(new_state_dict)
                             pinned_names_list.append(path)
+                            pinned_tied_weights_list.append(tied_weights)
                             pinned_total_mb += lora_size_mb
-                    # _pin_sd_to_memory(state_dict, path)
 
             del state_dict 
 
@@ -1767,7 +1655,6 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
             loras_nos.append(adapter_name)
             new_lora_path.append(path)        
             loras_multi.append(1.0 if i > (len(lora_multi) -1) else lora_multi[i])
-            pass
             adapter_no += 1
             if verboseLevel >=1:
                 if check_only:
@@ -1778,7 +1665,7 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
     model._loras_errors = errors
     if not check_only:
         if pinnedLora and len(pinned_sd_list) > 0:
-            _pin_sd_to_memory(pinned_sd_list, pinned_names_list)
+            _pin_sd_to_memory(pinned_sd_list, pinned_names_list, pinned_tied_weights_list)
         model._loras_adapters = adapters
     if activate_all_loras:
         activate_loras(model, loras_nos, loras_multi)
@@ -1873,7 +1760,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1885,19 +1772,19 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
         model_path = [model_path]
 
 
-    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") or file_name.endswith(".ckpt") for file_name in model_path):
-        raise Exception("full model path to file expected")
+    if not builtins.all(file_name.endswith(".sft") or file_name.endswith(".safetensors") or file_name.endswith(".pt") or file_name.endswith(".bin") or file_name.endswith(".ckpt") or get_extension_handler(file_name) is not None for file_name in model_path):
+        raise Exception(f"File Extension of file {model_path} is not supported")
 
     model_path = [ _get_model(file) for file in model_path] 
     if any( file == None for file in model_path):
-        raise Exception("Unable to find file")
+        raise Exception(f"Unable to find file {model_path}")
     
     verboseLevel = _compute_verbose_level(verboseLevel)
-    if model_path[-1].endswith(".pt") or model_path[-1].endswith(".ckpt"):
-        metadata = None
-    else:
+    if model_path[-1].endswith(".sft") or model_path[-1].endswith(".safetensors"):
         with safetensors2.safe_open(model_path[-1], writable_tensors =writable_tensors) as f:
             metadata = f.metadata() 
+    else:
+        metadata = None
 
     if metadata is None:
         transformer_config = None
@@ -1959,7 +1846,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
 
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd , modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
 
     return model
 
@@ -2086,11 +1973,14 @@ def load_sd(file_path, filters = None, keep_prefixes = False, writable_tensors =
 
 
 @cudacontext("cpu")
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, fused_split_map = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
-
+    if isinstance(preprocess_sd, dict):
+        preprocess_fn = lambda sd, qm, twm: map_state_dict([sd, qm, twm], rules=preprocess_sd)
+    else:
+        preprocess_fn = preprocess_sd 
     if not isinstance(file_path, list):
         file_path = [file_path]
 
@@ -2107,11 +1997,11 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
         else:
             resolved = _get_model(file)
             if isinstance(resolved, str):
-                resolved = _normalize_extension_path(resolved)
+                resolved = normalize_extension_path(resolved)
             normalized_paths.append(resolved)
     file_path = normalized_paths
     if any(file is None for file in file_path):
-        raise Exception("Unable to find file")
+        raise Exception(f"Unable to find file {file_path}")
     verboseLevel = _compute_verbose_level(verboseLevel)
 
     model = _remove_model_wrapper(model)
@@ -2140,8 +2030,8 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 raise Exception("Expected a tuple of (state_dict, quantization_map, tied_weights_map)")
         elif isinstance(file, dict):
             state_dict = file
-        elif isinstance(file, str) and _get_extension_handler(file) is not None:
-            ext_handler = _get_extension_handler(file)
+        elif isinstance(file, str) and get_extension_handler(file) is not None:
+            ext_handler = get_extension_handler(file)
             load_fn = getattr(ext_handler, "load_state_dict", None)
             if not callable(load_fn):
                 ext = os.path.splitext(file)[1].lower().lstrip(".")
@@ -2195,10 +2085,10 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 with open(quantization_map_path, 'r') as f:
                     quantization_map = json.load(f)
 
-        if preprocess_sd != None:
-            num_params = len(inspect.signature(preprocess_sd).parameters)
-            state_dict = preprocess_sd(*[state_dict, quantization_map, tied_weights_map][:num_params])
-            if isinstance(state_dict, tuple):
+        if preprocess_fn != None:
+            num_params = len(inspect.signature(preprocess_fn).parameters)
+            state_dict = preprocess_fn(*[state_dict, quantization_map, tied_weights_map][:num_params])
+            if isinstance(state_dict, (tuple,list)):
                 if len(state_dict)==2: 
                     state_dict, quantization_map = state_dict
                 else:
@@ -2251,7 +2141,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     if postprocess_sd != None:
         num_params = len(inspect.signature(postprocess_sd).parameters)
         state_dict = postprocess_sd(*[state_dict, quantization_map, tied_weights_map][:num_params])
-        if isinstance(state_dict, tuple):
+        if isinstance(state_dict, (tuple,list)):
             if len(state_dict)==2: 
                 state_dict, quantization_map = state_dict
             else:
@@ -2264,6 +2154,15 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             quantization_map = filter_state_dict_basic(quantization_map,base_model_prefix)
         if tied_weights_map != None:
             tied_weights_map = filter_state_dict_basic(tied_weights_map,base_model_prefix)
+
+    if fused_split_map:
+        state_dict, quantization_map = split_fused_weights(
+            state_dict,
+            quantization_map,
+            fused_split_map,
+            default_dtype=default_dtype,
+            verboseLevel=verboseLevel,
+        )
 
     post_load_hooks = []
     if quantization_map:
@@ -2605,13 +2504,17 @@ class offload:
                 param_size += torch.numel(p.data) * p.data.element_size()
 
 
-            if tied_param == None:
+            if tied_param is None:
                 blocks_params_size +=  param_size
                 self.parameters_ref[ref] = (submodule, k)
 
         for k, p in submodule.named_buffers(recurse=False):
-            blocks_params.append( (submodule, k, p, True, None) )
-            blocks_params_size += p.data.nbytes
+            ref = _get_tensor_ref(p)
+            tied_param =  self.parameters_ref.get(ref, None)
+            blocks_params.append( (submodule, k, p, True, tied_param) )
+            if tied_param is None:
+                blocks_params_size += p.data.nbytes
+                self.parameters_ref[ref] = (submodule, k)
 
         aft = blocks_params_size
 
@@ -2635,15 +2538,48 @@ class offload:
                 return False    
         return True
 
-    def _move_loras(self, loras_active_adapters, loras_modules,  to_GPU):
-        for name, lora_module in loras_modules.items():
+    def _move_loras(self, loras_active_adapters, loras_modules, to_GPU, model=None):
+        shortcuts = getattr(model, "_loras_model_shortcuts", None) if model is not None else None
+        tensor_cache = {}
+        alias_cache = {}
+
+        def _move_tensor(item):
+            if item is None:
+                return None
+            if torch.is_tensor(item):
+                ref = _get_tensor_ref(item)
+                moved = tensor_cache.get(ref, None)
+                if moved is None:
+                    moved = item.cuda(non_blocking=True)
+                    tensor_cache[ref] = moved
+                return moved
+            return item
+
+        def _resolve_alias(value, adapter):
+            if not isinstance(value, str):
+                return _move_tensor(value)
+            cache_key = (adapter, value)
+            cached = alias_cache.get(cache_key, None)
+            if cached is not None:
+                return cached
+            while isinstance(value, str):
+                target, slot = value.rsplit("#", 1)
+                value = shortcuts[target][adapter][int(slot)]
+            resolved = _move_tensor(value)
+            alias_cache[cache_key] = resolved
+            return resolved
+
+        for _, lora_module in loras_modules.items():
             for adapter in loras_active_adapters:
                 lora_data = lora_module.get(adapter, None)
-                if lora_data == None:
-                    continue                     
+                if lora_data is None:
+                    continue
                 key = adapter + '_GPU'
                 if to_GPU:
-                    lora_module[key] = [None if item == None else item.cuda(non_blocking=True) for item in lora_data[ :-1] ] + lora_data[ -1:] 
+                    moved_data = list(lora_data)
+                    for i in range(min(4, len(moved_data))):
+                        moved_data[i] = _resolve_alias(moved_data[i], adapter)
+                    lora_module[key] = moved_data
                 elif key in lora_module:
                     del lora_module[key]
             
@@ -2681,9 +2617,9 @@ class offload:
 
                     q = p.to("cuda", non_blocking=True)
                     if is_buffer:
-                        q = torch.nn.Buffer(q)
+                        q = _make_buffer(q)
                     else:
-                        q = torch.nn.Parameter(q , requires_grad=False)
+                        q = _make_parameter(q, requires_grad=False)                        
                     setattr(parent_module, n , q)
 
                     if tied_param != None:
@@ -2694,7 +2630,7 @@ class offload:
                         if lora_data != None:
                             loras_modules[parent_module]= lora_data
                 if len(loras_modules) > 0:
-                    self._move_loras(loras_active_adapters, loras_modules, True)
+                    self._move_loras(loras_active_adapters, loras_modules, True, model)
 
         loaded_block = self.loaded_blocks[model_id]
 
@@ -2766,9 +2702,9 @@ class offload:
         for param in blocks_params:
             parent_module, n, p, is_buffer, _  = param
             if is_buffer:
-                q = torch.nn.Buffer(p)
+                q = _make_buffer(p)
             else:
-                q = torch.nn.Parameter(p , requires_grad=False)
+                q = _make_parameter(p, requires_grad=False)
             setattr(parent_module, n , q)
             del p, q 
 
@@ -2778,7 +2714,7 @@ class offload:
                     loras_modules[parent_module]= lora_data
 
         if len(loras_modules) > 0:
-            self._move_loras(loras_active_adapters, loras_modules, False)
+            self._move_loras(loras_active_adapters, loras_modules, False, model)
 
         # cl.stop()
         # print(f"unload time: {cl.format_time_gap()}")
@@ -2896,7 +2832,7 @@ class offload:
             data = loras_data.get(active_adapter + '_GPU', None)
             if data == None:
                 continue
-            diff_w , _ , diff_b, _, alpha = data
+            diff_w, _, diff_b, _, alpha = data[:5]
             scaling = self._get_lora_scaling( loras_scaling, model, active_adapter) * alpha
             if scaling == 0:
                 continue
@@ -2926,7 +2862,7 @@ class offload:
         self,
         model,
         submodule,
-        adapters_data,                # dict: name+"_GPU" -> (A, B, diff_b, g_abs, alpha); g_abs=None means LoRA
+        adapters_data,                # dict: name+"_GPU" -> [A, B, diff_b, g_abs, alpha, meta?]; g_abs=None means LoRA
         weight= None,
         bias = None,
         original_bias = True,
@@ -2962,7 +2898,7 @@ class offload:
         for name in active_adapters:
             data = adapters_data.get(name + "_GPU", None)
             if data is None: continue
-            A, B, diff_b, g_abs, alpha = data
+            A, B, diff_b, g_abs, alpha = data[:5]
             if g_abs is None: continue  
 
             s = self._get_lora_scaling(loras_scaling, model, name) * float(alpha)
@@ -3019,6 +2955,19 @@ class offload:
 
         return weight, bias
 
+    def _lokr_chunk_forward(self, x_2d, lokr_w1, lokr_w2, specs=None):
+        n1 = int(lokr_w1.shape[1])
+        n2 = int(lokr_w2.shape[1])
+        if len(specs) == 0:
+            return x_2d.new_zeros((x_2d.shape[0], 0))
+
+        x_3d = x_2d.view(-1, n1, n2)
+        pieces = []
+        for r0, r1, c0, c1 in specs:
+            y = torch.matmul(lokr_w1[r0:r1].unsqueeze(0), x_3d)
+            pieces.append(torch.matmul(y, lokr_w2[c0:c1].T).reshape(-1, (r1 - r0) * (c1 - c0)))
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
+
 
 
     def _lora_linear_forward(self, model, submodule, loras_data, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
@@ -3026,56 +2975,57 @@ class offload:
         bias = submodule.bias
         active_adapters = model._loras_active_adapters
         loras_scaling = model._loras_scaling
-        any_dora = loras_data.get("any_dora", False)
-        training = False
+        any_dora = False
+        any_lokr = False
+        for active_adapter in active_adapters:
+            data = loras_data.get(active_adapter + '_GPU', None)
+            if data is None:
+                continue
+            if data[3] is not None:
+                any_dora = True
+            meta = data[5]
+            if meta.get("type", "lora") == "lokr":
+                any_lokr = True
+            if any_dora and any_lokr:
+                break
 
         dtype = weight.dtype
-        if (weight.shape[-1] < x.shape[-2] and False or any_dora): # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
+        if any_dora and not any_lokr: # sum base weight and lora matrices instead of applying input on each sub lora matrice if input is too large. This will save a lot VRAM and compute
             original_bias = True
-            original_bias = True
-            if len(active_adapters) > 0:
-                if isinstance(submodule, QModuleMixin): 
-                    weight = weight.view(weight.shape) # get a persistent copy of the on the fly dequantized weights
-                else:
-                    weight = weight.clone()
-                for active_adapter in active_adapters:
-                    data = loras_data.get(active_adapter + '_GPU', None)
-                    if data == None:
-                        continue                    
-                    lora_A_weight, lora_B_weight, diff_b, g_abs, alpha = data
-                    scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
-                    if scaling == 0 or g_abs is not None:
-                        continue
-                    target_dtype = weight.dtype
-                    if lora_A_weight is not None and lora_A_weight.dtype != target_dtype:
-                        lora_A_weight = lora_A_weight.to(target_dtype)
-                    if lora_B_weight is not None and lora_B_weight.dtype != target_dtype:
-                        lora_B_weight = lora_B_weight.to(target_dtype)
-                    if diff_b is not None and diff_b.dtype != target_dtype:
-                        diff_b = diff_b.to(target_dtype)
-                    if lora_A_weight != None:
-                        weight.addmm_(lora_B_weight, lora_A_weight, alpha= scaling )
-                    
-                    if diff_b != None:
-                        if bias == None:
-                            bias = diff_b.clone()
-                            original_bias = False
-                        elif original_bias:
-                            bias = bias.clone()
-                            original_bias = False
-                        bias.add_(diff_b, alpha=scaling)
-                    # base_weight += scaling * lora_B_weight @ lora_A_weight
-
-                if any_dora :
-                    weight, bias = self._dora_linear_forward(model, submodule, loras_data, weight, bias, original_bias)
-            if training:
-                pass
-                # result = torch.nn.functional.linear(dropout(x), base_weight, bias=submodule.bias)
+            if isinstance(submodule, QModuleMixin):
+                weight = weight.view(weight.shape) # get a persistent copy of the on the fly dequantized weights
             else:
-                base_bias = bias
-                if base_bias is not None and base_bias.dtype != x.dtype:
-                    base_bias = base_bias.to(x.dtype)
-                result = torch.nn.functional.linear(x, weight, bias=base_bias)
+                weight = weight.clone()
+            for active_adapter in active_adapters:
+                data = loras_data.get(active_adapter + '_GPU', None)
+                if data is None:
+                    continue
+                lora_A_weight, lora_B_weight, diff_b, g_abs, alpha = data[:5]
+                scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
+                if scaling == 0 or g_abs is not None:
+                    continue
+                target_dtype = weight.dtype
+                if lora_A_weight is not None and lora_A_weight.dtype != target_dtype:
+                    lora_A_weight = lora_A_weight.to(target_dtype)
+                if lora_B_weight is not None and lora_B_weight.dtype != target_dtype:
+                    lora_B_weight = lora_B_weight.to(target_dtype)
+                if diff_b is not None and diff_b.dtype != target_dtype:
+                    diff_b = diff_b.to(target_dtype)
+                if lora_A_weight is not None:
+                    weight.addmm_(lora_B_weight, lora_A_weight, alpha=scaling)
+                if diff_b is not None:
+                    if bias is None:
+                        bias = diff_b.clone()
+                        original_bias = False
+                    elif original_bias:
+                        bias = bias.clone()
+                        original_bias = False
+                    bias.add_(diff_b, alpha=scaling)
+            weight, bias = self._dora_linear_forward(model, submodule, loras_data, weight, bias, original_bias)
+            base_bias = bias
+            if base_bias is not None and base_bias.dtype != x.dtype:
+                base_bias = base_bias.to(x.dtype)
+            result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
         else:
             base_bias = bias
@@ -3083,17 +3033,20 @@ class offload:
                 base_bias = base_bias.to(x.dtype)
             result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
-            if len(active_adapters) > 0:
+            if active_adapters:
                 compute_dtype = result.dtype
                 if result.dtype != compute_dtype:
                     result = result.to(compute_dtype)
                 x = x.to(compute_dtype)
+                x_2d = x.reshape(-1, x.shape[-1])
+                result_2d = result.reshape(-1, result.shape[-1])
 
                 for active_adapter in active_adapters:
                     data = loras_data.get(active_adapter + '_GPU', None)
-                    if data == None:
+                    if data is None:
                         continue
-                    lora_A, lora_B, diff_b, g_abs, alpha = data
+                    lora_A, lora_B, diff_b, g_abs, alpha, adapter_meta = data
+                    adapter_type = adapter_meta.get("type", "lora")
                     # dropout = self.lora_dropout[active_adapter]
                     scaling = self._get_lora_scaling(loras_scaling, model, active_adapter) * alpha
                     if scaling == 0 or g_abs is not None:
@@ -3106,11 +3059,35 @@ class offload:
                     if diff_b is not None and diff_b.dtype != target_dtype:
                         diff_b = diff_b.to(target_dtype)
 
-                    if lora_A == None:
-                        result.add_(diff_b, alpha=scaling)
+                    if adapter_type == "lokr":
+                        if lora_A is None or lora_B is None:
+                            continue
+                        n1 = int(lora_A.shape[1])
+                        n2 = int(lora_B.shape[1])
+                        out_dim = int(lora_A.shape[0]) * int(lora_B.shape[0])
+                        chunk = adapter_meta.get("lokr_chunk", None)
+                        if chunk is None:
+                            x_3d = x_2d.view(-1, n1, n2)
+                            y = torch.matmul(lora_A.unsqueeze(0), x_3d)
+                            y = torch.matmul(y, lora_B.T)
+                            result_2d.add_(y.reshape(-1, out_dim), alpha=scaling)
+                        else:
+                            specs = adapter_meta.get("lokr_specs", [])
+                            y = self._lokr_chunk_forward(x_2d, lora_A, lora_B, specs=specs)
+                            result_2d.add_(y, alpha=scaling)
+                        if diff_b is not None:
+                            result_2d.add_(diff_b, alpha=scaling)
+                        del y
+                        continue
+                    if adapter_type == "diff":
+                        result_2d.addmm_(x_2d, lora_B.T, beta=1, alpha=scaling)
+                        if diff_b is not None:
+                            result_2d.add_(diff_b, alpha=scaling)
+                        continue
+
+                    if lora_A is None:
+                        result_2d.add_(diff_b, alpha=scaling)
                     else:
-                        x_2d = x.reshape(-1, x.shape[-1])
-                        result_2d = result.reshape(-1, result.shape[-1])
                         y = x_2d @ lora_A.T
                         result_2d.addmm_(y, lora_B.T, beta=1, alpha=scaling)
                         if diff_b is not None:
@@ -3219,7 +3196,6 @@ def {fname}(module, *args, **kwargs):
         target_module.forward = functools.update_wrapper(functools.partial(wrapper_fn, target_module), previous_method) 
 
     def hook_check_load_into_GPU_if_needed_default(self, target_module, model, model_id, blocks_name, previous_method,  context):
-
         dtype = model._dtype
         weight = getattr(target_module, "weight", None)
         weight_qtype = getattr(weight, "qtype", None) if weight is not None else None
@@ -3596,6 +3572,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     #  Hook forward methods of modules 
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
+        current_model._force_device= "cuda"
         towers_names, towers_modules = _detect_main_towers(current_model)
         compilationInThisOne = compileAllModels or model_id in modelsToCompile 
                 
@@ -3606,7 +3583,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             else:
                 _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel)            
 
-        current_budget = model_budgets[model_id]
+        current_budget = getattr(current_model, "_budget", model_budgets[model_id])
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
         self.loaded_blocks[model_id] = None
         any_lora =  loras !=None and model_id in loras
@@ -3614,6 +3591,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             loras_model_data, loras_model_shortcuts = {}, {}
             current_model._loras_model_data = loras_model_data 
             current_model._loras_model_shortcuts = loras_model_shortcuts
+        modules_to_be_compiled, modules_names_to_be_compiled = [], []
         for submodule_name, submodule in current_model.named_modules():  
             # create a fake 'accelerate' parameter so that the _execution_device property returns always "cuda" 
             # (it is queried in many pipelines even if offloading is not properly implemented)  
@@ -3646,6 +3624,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             offload_hooks = submodule._offload_hooks if hasattr(submodule, "_offload_hooks") else [] 
             assert top_submodule or len(offload_hooks) == 0, "custom offload hooks can only be set at the of the module"
             submodule_method_names = ["forward"] +  offload_hooks
+            compile_me = getattr(submodule, "_compile_me", None)
             for submodule_method_name in submodule_method_names:
                 if not hasattr(submodule, submodule_method_name ): continue
                 if submodule_method_name == "forward" and any_lora and hasattr(submodule,"weight"):
@@ -3657,8 +3636,11 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                         pass
                     if top_submodule and cur_blocks_name is None and not (any_lora and len(submodule._parameters)):
                         self.hook_change_module(submodule, current_model, model_id, submodule_name, submodule_method, submodule_method_name)
-                    elif compilationInThisOne and submodule in towers_modules: 
+                    elif compilationInThisOne and submodule in towers_modules and not compile_me == False or compile_me == True: 
                         self.hook_preload_blocks_for_compilation(submodule, model_id, cur_blocks_name, context = submodule_name )
+                        compile_item_name= ".".join(submodule_name.split(".")[:-1]) if submodule_name[-1].isdigit() else submodule_name
+                        if compile_item_name not in modules_names_to_be_compiled: modules_names_to_be_compiled.append(compile_item_name)
+                        modules_to_be_compiled.append(submodule)
                     else:
                         if compilationInThisOne: #and False
                             self.hook_check_load_into_GPU_if_needed(submodule, current_model, model_id, cur_blocks_name, submodule_method, context = submodule_name )
@@ -3671,13 +3653,13 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
         # compile main iterative modules stacks ("towers")
         if compilationInThisOne:
             if self.verboseLevel>=1:
-                if len(towers_modules)>0:
-                    formated_tower_names = [name + '*' for name in towers_names]
-                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_tower_names}.")
+                if len(modules_names_to_be_compiled)>0:
+                    formated_compiled_names = [name + '.*' for name in modules_names_to_be_compiled]
+                    print(f"Pytorch compilation of '{model_id}' is scheduled for these modules : {formated_compiled_names}.")
                 else:
                     print(f"Pytorch compilation of model '{model_id}' is not yet supported.")
 
-            for submodel in towers_modules:
+            for submodel in modules_to_be_compiled:
                 submodel.forward= torch.compile(submodel.forward,  backend= "inductor", mode= compile_mode) # , fullgraph= True, mode= "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs",  
                     #dynamic=True,
 

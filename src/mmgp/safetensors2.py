@@ -1,4 +1,4 @@
-# ------------------ Safetensors2 1.3 by DeepBeepMeep (mmgp)------------------
+# ------------------ Safetensors2 1.4 by DeepBeepMeep (mmgp)------------------
 #
 # This module entirely written in Python is a replacement for the safetensor library which requires much less RAM to load models.
 # It can be conveniently used to keep a low RAM consumption when handling  transit data (for instance when quantizing or transferring tensors to reserver RAM)
@@ -71,9 +71,12 @@ class MmapTracker:
                 print(f"MMap Manager of file '{self.file_path}' : MMap no {map_id} has been released" + text)
             if self.count == self._already_released:
                 # print(f"MMAP Del: {self.file_path}: {mmm.keys()}")
-                del mmm[self.mmm_key ]
+                mmm_ref = globals().get("mmm")
+                if isinstance(mmm_ref, dict):
+                    mmm_ref.pop(self.mmm_key, None)
 
-            self._maps.pop(map_id, None)
+            if isinstance(self._maps, dict):
+                self._maps.pop(map_id, None)
 
         wr = weakref.ref(mmap_obj, finalizer)
         self._maps[map_id] = {
@@ -199,10 +202,6 @@ def _read_safetensors_header(path, file):
 
 
 def load_metadata_state_dict(file_path):
-    if str(file_path).lower().endswith(".gguf"):
-        from shared.qtypes import gguf as gguf_handler
-        metadata = gguf_handler.read_gguf_metadata(file_path)
-        return OrderedDict(), metadata
     with open(file_path, 'rb') as f:
         catalog, metadata, _ = _read_safetensors_header(file_path, f)
     sd = OrderedDict()
@@ -301,7 +300,7 @@ def torch_write_file(sd, file_path, quantization_map = None, config = None, extr
 class SafeTensorFile:
     """Main class for accessing safetensors files that provides memory-efficient access"""
     
-    def __init__(self, file_path, metadata, catalog, skip_bytes, lazy_loading = True, writable_tensors = True):
+    def __init__(self, file_path, metadata, catalog, skip_bytes, lazy_loading = True, writable_tensors = True, device = "cpu", streaming = False):
         self._file_path = file_path
         self._metadata = metadata
         self._catalog = catalog
@@ -311,15 +310,21 @@ class SafeTensorFile:
         self.mtracker = None
         self.lazy_loading = lazy_loading
         self.writable_tensors = writable_tensors
+        self._device = torch.device(device)
+        self._streaming = bool(streaming)
+        self._streaming_handle = None
+        self._streaming_position = None
 
     @classmethod
-    def load_metadata(cls, file_path, lazy_loading = True, writable_tensors = True):
+    def load_metadata(cls, file_path, lazy_loading = True, writable_tensors = True, device = "cpu", streaming = False):
         with open(file_path, 'rb') as f:
             catalog, metadata, skip_bytes = _read_safetensors_header(file_path, f)
 
-        return cls(file_path, metadata, catalog, skip_bytes, lazy_loading, writable_tensors )
+        return cls(file_path, metadata, catalog, skip_bytes, lazy_loading, writable_tensors, device=device, streaming=streaming)
 
     def init_tensors(self, lazyTensors = True, writable_tensors = True):
+        if self._streaming:
+            return None
         if self.sd is None:
             self.lazy_loading = lazyTensors
             if lazyTensors:
@@ -426,11 +431,75 @@ class SafeTensorFile:
                 sd[k] = t
         return sd
 
+    def _open_streaming_handle(self):
+        if self._streaming_handle is None:
+            self._streaming_handle = open(self._file_path, 'rb')
+            self._streaming_handle.seek(self._skip_bytes, 0)
+            self._streaming_position = self._skip_bytes
+
+    def _close_streaming_handle(self):
+        if self._streaming_handle is not None:
+            self._streaming_handle.close()
+            self._streaming_handle = None
+            self._streaming_position = None
+
+    def _create_tensor_from_buffer(self, shape, dtype, buffer):
+        source_buffer = bytearray(buffer) if self.writable_tensors else buffer
+        if len(buffer) == 0:
+            t = torch.empty(shape, dtype=dtype)
+        elif len(shape) == 0:
+            t = torch.frombuffer(source_buffer, dtype=torch.uint8).view(dtype)
+        else:
+            t = torch.frombuffer(source_buffer, dtype=dtype)
+            t = torch.reshape(t, shape)
+        if self._device.type != "cpu":
+            t = t.to(self._device, non_blocking=True)
+        return t
+
+    def create_tensor_with_streaming(self, name: str) -> torch.tensor:
+        if name not in self._catalog:
+            raise KeyError(f"Tensor not found: {name}")
+
+        v = self._catalog[name]
+        dtypestr = v["dtype"]
+        dtype = _map_to_dtype[dtypestr]
+        shape = v["shape"]
+        data_offsets = v["data_offsets"]
+        start = self._skip_bytes + data_offsets[0]
+        end = self._skip_bytes + data_offsets[1]
+        length = end - start
+
+        self._open_streaming_handle()
+        if self._streaming_position != start:
+            self._streaming_handle.seek(start, 0)
+            self._streaming_position = start
+
+        buffer = self._streaming_handle.read(length)
+        if len(buffer) != length:
+            raise EOFError(f"Unexpected EOF while reading tensor '{name}' from {self._file_path}")
+        self._streaming_position = end
+        return self._create_tensor_from_buffer(shape, dtype, buffer)
+
+    def reorder_for_streaming(self, names):
+        def seek_key(tensor_name):
+            if tensor_name not in self._catalog:
+                raise KeyError(f"Tensor not found: {tensor_name}")
+            return self._catalog[tensor_name]["data_offsets"][0]
+
+        if isinstance(names, list):
+            return sorted(names, key=seek_key)
+        if isinstance(names, dict):
+            ordered_names = sorted(names.keys(), key=seek_key)
+            return names.__class__((name, names[name]) for name in ordered_names)
+        raise TypeError("reorder_for_streaming expects a list or dictionary of tensor names")
+
     def get_slice(self, name: str) -> torch.tensor:
         return tensor_slice(self._catalog, name, self.get_tensor(name))
     
     def get_tensor(self, name: str) -> torch.tensor:
         """Get a tensor by name"""
+        if self._streaming:
+            return self.create_tensor_with_streaming(name)
         # To do : switch to a JIT tensor creation per tensor
         self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return self.sd[name]
@@ -447,6 +516,11 @@ class SafeTensorFile:
         
     def tensors(self) -> Dict[str, torch.tensor]:
         """Get dictionary of all tensors"""
+        if self._streaming:
+            sd = OrderedDict()
+            for name in self.keys():
+                sd[name] = self.get_tensor(name)
+            return sd
         self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return self.sd
         
@@ -456,7 +530,6 @@ class SafeTensorFile:
         
     def __len__(self) -> int:
         """Get number of tensors"""
-        self.init_tensors(self.lazy_loading, writable_tensors= self.writable_tensors)
         return len(self.keys())
         
     def __contains__(self, key: str) -> bool:
@@ -468,15 +541,20 @@ class SafeTensorFile:
         return ((name, self.get_tensor(name)) for name in self.keys())
 
     def _free_resources(self):
-        del self.sd
-        del self._catalog 
+        self._close_streaming_handle()
+        if hasattr(self, "sd"):
+            del self.sd
+        if hasattr(self, "_catalog"):
+            del self._catalog 
         
 class _SafeTensorLoader:
     """Context manager for loading SafeTensorFile"""
     
-    def __init__(self, filename: str, writable_tensors = True ):
+    def __init__(self, filename: str, writable_tensors = True, device = "cpu", streaming = False ):
         self.filename = Path(filename)
         self.writable_tensors = writable_tensors
+        self.device = device
+        self.streaming = streaming
         self.sft = None
         if not self.filename.exists():
             raise FileNotFoundError(f"File not found: {filename}")
@@ -489,7 +567,7 @@ class _SafeTensorLoader:
             writable_tensors = False
 
         try:
-            self.sft = SafeTensorFile.load_metadata(self.filename, writable_tensors= writable_tensors)
+            self.sft = SafeTensorFile.load_metadata(self.filename, writable_tensors=writable_tensors, device=self.device, streaming=self.streaming)
             return self.sft 
             
         except Exception as e:
@@ -499,6 +577,11 @@ class _SafeTensorLoader:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         """Clean up resources"""        
         self.close()
+
+    def keys(self):
+        sd, _ = load_metadata_state_dict(self.filename)
+        return list(sd)
+
 
     def get_tensor(self, name):
         if self.sft == None:
@@ -516,10 +599,12 @@ class _SafeTensorLoader:
         pass
 
 
-def safe_open(filename: str, framework: str = "pt",device = "cpu", writable_tensors = True) -> _SafeTensorLoader:
-    if device != "cpu" or framework !="pt":
+def safe_open(filename: str, framework: str = "pt",device = "cpu", writable_tensors = True, streaming = False) -> _SafeTensorLoader:
+    if framework != "pt":
         return _old_safe_open(filename =filename, framework=framework, device=device)
-    return _SafeTensorLoader(filename, writable_tensors = writable_tensors)
+    if device != "cpu" and not streaming:
+        return _old_safe_open(filename =filename, framework=framework, device=device)
+    return _SafeTensorLoader(filename, writable_tensors=writable_tensors, device=device, streaming=streaming)
 
 def torch_load_file( filename, device = 'cpu', writable_tensors = True) -> Dict[str, torch.Tensor]:
     sd = {}
