@@ -217,7 +217,7 @@ def _compute_verbose_level(level):
 
 def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
     if perc_reserved_mem_max <=0:
-        perc_reserved_mem_max = os.getenv("perc_reserved_mem_max", 0)
+        perc_reserved_mem_max = float(os.getenv("perc_reserved_mem_max", 0))
 
     if perc_reserved_mem_max <= 0:             
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
