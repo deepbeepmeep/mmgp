@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.7 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.8 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -217,8 +217,9 @@ def _compute_verbose_level(level):
     return level
 
 def _get_perc_reserved_mem_max(perc_reserved_mem_max = 0):
+    perc_reserved_mem_max = float(perc_reserved_mem_max or 0)
     if perc_reserved_mem_max <=0:
-        perc_reserved_mem_max = os.getenv("perc_reserved_mem_max", 0)
+        perc_reserved_mem_max = float(os.getenv("perc_reserved_mem_max", 0) or 0)
 
     if perc_reserved_mem_max <= 0:             
         perc_reserved_mem_max = 0.40 if os.name == 'nt' else 0.5        
@@ -1936,9 +1937,17 @@ def flush_torch_caches():
             pass
     from accelerate import init_empty_weights
     with init_empty_weights():
-        for _ in range(3):
-            dummy_tensor = torch.nn.Embedding(256384, 1024)
-            dummy_tensor = None    
+        try:
+            for _ in range(3):
+                dummy_tensor = torch.nn.Embedding(256384, 1024)
+                dummy_tensor = None    
+        except Exception:
+            pass
+        dummy_tensor = None    
+
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def map_state_dict(state_dict, rules):
