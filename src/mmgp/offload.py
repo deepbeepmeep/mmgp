@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.5 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.7 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -63,6 +63,7 @@ import json
 import inspect
 import psutil
 import builtins
+import fnmatch
 from accelerate import init_empty_weights
 from functools import wraps
 import functools
@@ -826,7 +827,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.5) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.7) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -958,7 +959,48 @@ def _requantize(model: torch.nn.Module, state_dict: dict, quantization_map: dict
 
 
 
-def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2**31, model_id = 'Unknown'):
+def _quantize_exclude_modules(model_to_quantize, quantize_exclude, verboseLevel=1):
+    if quantize_exclude is None:
+        return []
+    if isinstance(quantize_exclude, str):
+        quantize_exclude = [quantize_exclude]
+
+    matched = []
+    pattern_matches = {pattern: False for pattern in quantize_exclude}
+    for submodule_name, submodule in model_to_quantize.named_modules():
+        if submodule_name == "":
+            continue
+        candidates = [submodule_name]
+        candidates += [f"{submodule_name}.{name}" for name, _ in submodule.named_parameters(recurse=False)]
+        candidates += [f"{submodule_name}.{name}" for name, _ in submodule.named_buffers(recurse=False)]
+        module_matches = False
+        for pattern in quantize_exclude:
+            if any(fnmatch.fnmatchcase(candidate, pattern) for candidate in candidates):
+                pattern_matches[pattern] = True
+                module_matches = True
+        if module_matches:
+            matched.append(submodule_name)
+
+    if verboseLevel >= 1 and len(matched) > 0:
+        print(f"User excluded {len(matched)} modules from quantization")
+    if verboseLevel >= 2:
+        missing = [pattern for pattern, did_match in pattern_matches.items() if not did_match]
+        if len(missing) > 0:
+            print(f"User quantization exclude patterns not matched: {missing}")
+    return matched
+
+
+def _unique_list(values):
+    unique = []
+    seen = set()
+    for value in values:
+        if value not in seen:
+            unique.append(value)
+            seen.add(value)
+    return unique
+
+
+def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2**31, model_id = 'Unknown', quantize_exclude = None):
     
     total_size =0
     total_excluded = 0
@@ -1053,10 +1095,12 @@ def _quantize(model_to_quantize, weights=qint8, verboseLevel = 1, threshold = 2*
         exclude_list = None
 
 
+    user_exclude_list = _quantize_exclude_modules(model_to_quantize, quantize_exclude, verboseLevel=verboseLevel)
     if exclude_list is None:
-        exclude_list = list(tied_weights)
+        exclude_list = list(tied_weights) + user_exclude_list
     else:
-        exclude_list += list(tied_weights)
+        exclude_list += list(tied_weights) + user_exclude_list
+    exclude_list = _unique_list(exclude_list)
     quantize(model_to_quantize, weights= weights, exclude= exclude_list)
 
 
@@ -1327,7 +1371,6 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
         skip = False
         tied_weights = None
         state_dict = safetensors2.torch_load_file(path, writable_tensors= False)
-
         if preprocess_sd != None:
             state_dict = preprocess_sd(state_dict)
 
@@ -1351,6 +1394,18 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                     new_state_dict[k] = v
                 state_dict = new_state_dict
                 del new_state_dict
+
+            src_suffixes = (".default.weight", ".lora.A.weight", ".lora.B.weight", ".lora.down.weight", ".lora.up.weight")
+            tgt_suffixes = (".weight", ".lora_A.weight", ".lora_B.weight", ".lora_down.weight", ".lora_up.weight")
+            new_sd = {}
+            for k,v in state_dict.items():
+                for src, tgt in zip(src_suffixes, tgt_suffixes):
+                    if k.endswith(src):
+                        k = k[:-len(src)] + tgt
+                        break
+                new_sd[k] = v
+            state_dict = new_sd
+            del new_sd,k,v
 
         if not fail:
             lokr_split_chunks = {}
@@ -1760,7 +1815,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}, quantize_exclude = None):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1846,7 +1901,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
 
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, quantize_exclude = quantize_exclude, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
 
     return model
 
@@ -1857,16 +1912,16 @@ def flush_torch_caches():
             torch.cuda.synchronize()
         except torch.cuda.CudaError:
             pass
-        for idx in range(torch.cuda.device_count()):
-            with torch.cuda.device(idx):
-                torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats()
+        # for idx in range(torch.cuda.device_count()):
+        #     with torch.cuda.device(idx):
+        torch.cuda.empty_cache()
+        # torch.cuda.ipc_collect()
+        # torch.cuda.reset_peak_memory_stats()
     try:
         torch._C._host_emptyCache()
     except AttributeError:
         pass
-    if os.name == "nt":
+    if os.name == "nt" and False: # suspicion of crash
         try:
             import ctypes, ctypes.wintypes as wintypes, os as _os
             PROCESS_SET_QUOTA = 0x0100
@@ -1973,7 +2028,7 @@ def load_sd(file_path, filters = None, keep_prefixes = False, writable_tensors =
 
 
 @cudacontext("cpu")
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, fused_split_map = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, fused_split_map = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False, quantize_exclude = None):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -2257,7 +2312,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             if verboseLevel >=1:
                 print("Model already quantized")
         else:
-            if _quantize(model, quantizationType, verboseLevel=verboseLevel, model_id=file_path):
+            if _quantize(model, quantizationType, verboseLevel=verboseLevel, model_id=file_path, quantize_exclude=quantize_exclude):
                 quantization_map = model._quanto_map  
 
     if pinToMemory:
@@ -2265,7 +2320,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
 
     return
 
-def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None, filter_sd =None ):
+def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None, filter_sd =None, quantize_exclude = None):
     """save the weights of a model and quantize them if requested
     These weights can be loaded again using 'load_model_data'
     """       
@@ -2297,7 +2352,7 @@ def save_model(model, file_path, do_quantize = False, quantizationType = qint8, 
                 config= json.loads(text)
 
     if do_quantize:
-        _quantize(model, weights=quantizationType, model_id=file_path, verboseLevel=verboseLevel)
+        _quantize(model, weights=quantizationType, model_id=file_path, verboseLevel=verboseLevel, quantize_exclude=quantize_exclude)
     
     quantization_map = getattr(model, "_quanto_map", None)
 
@@ -2400,6 +2455,9 @@ class HfHook:
         return module
     
 def _mm_lora_linear_forward(module, *args, **kwargs):
+    loras_data = getattr(module, "_mm_lora_data", None)
+    if not loras_data:
+        return module._mm_lora_old_forward(*args, **kwargs)
     if args:
         inp = args[0]
     else:
@@ -2413,9 +2471,6 @@ def _mm_lora_linear_forward(module, *args, **kwargs):
             else:
                 kwargs = dict(kwargs)
                 kwargs["input"] = inp
-    loras_data = getattr(module, "_mm_lora_data", None)
-    if not loras_data:
-        return module._mm_lora_old_forward(*args, **kwargs)
     if not hasattr(module, "_mm_manager"):
         pass
     return module._mm_manager._lora_linear_forward(
