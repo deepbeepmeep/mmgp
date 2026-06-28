@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.8 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.9 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -2465,8 +2465,6 @@ class HfHook:
     
 def _mm_lora_linear_forward(module, *args, **kwargs):
     loras_data = getattr(module, "_mm_lora_data", None)
-    if not loras_data:
-        return module._mm_lora_old_forward(*args, **kwargs)
     if args:
         inp = args[0]
     else:
@@ -2480,6 +2478,9 @@ def _mm_lora_linear_forward(module, *args, **kwargs):
             else:
                 kwargs = dict(kwargs)
                 kwargs["input"] = inp
+    loras_data = getattr(module, "_mm_lora_data", None)
+    if not loras_data:
+        return module._mm_lora_old_forward(*args, **kwargs)
     if not hasattr(module, "_mm_manager"):
         pass
     return module._mm_manager._lora_linear_forward(
