@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.9 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.10 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -828,7 +828,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.7) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.10) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -3096,7 +3096,10 @@ class offload:
             base_bias = bias
             if base_bias is not None and base_bias.dtype != x.dtype:
                 base_bias = base_bias.to(x.dtype)
-            result = torch.nn.functional.linear(x, weight, bias=base_bias)
+            if getattr(submodule, "_mm_requires_native_linear_forward", False):
+                result = submodule._mm_lora_old_forward(x, *args, **kwargs)
+            else:
+                result = torch.nn.functional.linear(x, weight, bias=base_bias)
 
             if active_adapters:
                 compute_dtype = result.dtype
