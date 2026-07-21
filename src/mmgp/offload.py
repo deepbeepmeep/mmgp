@@ -3035,6 +3035,7 @@ class offload:
 
 
 
+    @torch.compiler.disable
     def _lora_linear_forward(self, model, submodule, loras_data, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         weight = submodule.weight
         bias = submodule.bias
