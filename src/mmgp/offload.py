@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.10 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.7.11 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -93,8 +93,20 @@ class QEmbedding(QModuleMixin, torch.nn.Embedding):
         module.bias = None
         return cls( module.num_embeddings, module.embedding_dim, module.padding_idx , module.max_norm, module.norm_type, module.scale_grad_by_freq, module.sparse, dtype=module.weight.dtype, device=device, weights=weights,
                     activations=activations, optimizer=optimizer, quantize_input=True)      
+    @classmethod
+    def from_module(cls, module, weights = None, activations = None, optimizer = None):
+        qmodule = super().from_module(module, weights, activations, optimizer)
+        if "embed_scale" in module._buffers:
+            qmodule.register_buffer("embed_scale", module._buffers["embed_scale"], persistent="embed_scale" not in module._non_persistent_buffers_set)
+        elif hasattr(module, "embed_scale"):
+            qmodule.embed_scale = module.embed_scale
+        return qmodule
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return torch.nn.functional.embedding( input, self.qweight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse )
+        output = torch.nn.functional.embedding( input, self.qweight, self.padding_idx, self.max_norm, self.norm_type, self.scale_grad_by_freq, self.sparse )
+        embed_scale = getattr(self, "embed_scale", None)
+        if torch.is_tensor(embed_scale):
+            embed_scale = embed_scale.to(device=output.device, dtype=output.dtype)
+        return output if embed_scale is None else output * embed_scale
 
 
 
@@ -828,7 +840,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.10) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.11) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1816,7 +1828,7 @@ def move_loras_to_device(model, device="cpu" ):
         if ".lora_" in k:
             m.to(device)
 
-def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}, quantize_exclude = None):
+def fast_load_transformers_model(model_path: str,  do_quantize = False, quantizationType =  qint8, pinToMemory = False, partialPinning = False, forcedConfigPath = None, defaultConfigPath = None, modelClass=None, modelPrefix = None, writable_tensors = True, verboseLevel = -1, preprocess_sd  = None, fused_split_map = None, modules = None,  return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, configKwargs ={}, quantize_exclude = None, pre_load_callback = None):
     """
     quick version of .LoadfromPretrained of  the transformers library
     used to build a model and load the corresponding weights (quantized or not)
@@ -1902,7 +1914,8 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
 
     model._config = transformer_config
 
-    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, quantize_exclude = quantize_exclude, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel )
+    load_model_data(model,model_path, do_quantize = do_quantize, quantizationType = quantizationType, quantize_exclude = quantize_exclude, pinToMemory= pinToMemory, partialPinning= partialPinning, modelPrefix = modelPrefix, writable_tensors =writable_tensors, preprocess_sd = preprocess_sd, fused_split_map = fused_split_map, modules = modules, return_shared_modules =  return_shared_modules, default_dtype = default_dtype, ignore_unused_weights = ignore_unused_weights, verboseLevel=verboseLevel, pre_load_callback=pre_load_callback )
+    model.eval().requires_grad_(False)
 
     return model
 
@@ -2037,7 +2050,7 @@ def load_sd(file_path, filters = None, keep_prefixes = False, writable_tensors =
 
 
 @cudacontext("cpu")
-def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, fused_split_map = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False, quantize_exclude = None):
+def load_model_data(model, file_path, do_quantize = False, quantizationType = qint8, pinToMemory = False, partialPinning = False, modelPrefix = None, writable_tensors = True,  preprocess_sd = None, postprocess_sd = None, fused_split_map = None, modules = None, return_shared_modules = None, default_dtype = torch.bfloat16, ignore_unused_weights = False, verboseLevel = -1, ignore_missing_keys = False, quantize_exclude = None, pre_load_callback = None):
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
@@ -2237,6 +2250,25 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             default_dtype=default_dtype,
             verboseLevel=verboseLevel,
         )
+    if pre_load_callback is not None:
+        pre_load_callback(model)
+    parameter_dtypes = {}
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        module_dtype = getattr(module, "_lock_dtype", default_dtype)
+        for name, parameter in module.named_parameters(recurse=False, remove_duplicate=False):
+            parameter_dtypes[f"{module_name}.{name}" if module_name else name] = getattr(parameter, "_lock_dtype", module_dtype)
+    quantized_weights = {f"{name}.weight" for name, qconfig in quantization_map.items() if qconfig["weights"] != "none"}
+    converted = {}
+    for key in parameter_dtypes.keys() & state_dict.keys():
+        tensor = state_dict[key]
+        target_dtype = parameter_dtypes[key]
+        if target_dtype is None or key in quantized_weights or isinstance(tensor, QTensor) or tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32) or tensor.dtype == target_dtype:
+            continue
+        ref = id(tensor)
+        if ref not in converted:
+            converted[ref] = tensor.to(target_dtype)
+        state_dict[key] = converted[ref]
+    converted = None
 
     if len(quantization_map) == 0:
         if any(isinstance(file, str) and "quanto" in file for file in file_path) and not do_quantize:
@@ -3457,6 +3489,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     quantizeTransformer: set True by default will quantize on the fly the video / image model
     pinnedMemory: move models in reserved memor. This allows very fast performance but requires 50% extra RAM (usually >=64 GB)
     extraModelsToQuantize: a list of models to be also quantized on the fly (e.g the text_encoder), useful to reduce bith RAM and VRAM consumption
+    convertWeightsFloatTo: default dtype for remaining FP32 parameters. A model-level _convertWeightsFloatTo overrides it; None preserves FP32.
     budgets: 0 by default (unlimited). If non 0, it corresponds to the maximum size in MB that every model will occupy at any moment
         (in fact the real usage is twice this number). It is very efficient to reduce VRAM consumption but this feature may be very slow
         if pinnedMemory is not enabled
@@ -3554,6 +3587,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     estimatesBytesToPin = 0
     for model_id in models: 
         current_model: torch.nn.Module = models[model_id] 
+        model_convertWeightsFloatTo = getattr(current_model, "_convertWeightsFloatTo", convertWeightsFloatTo)
         # make sure that no RAM or GPU memory is not allocated for gradiant / training
         current_model.to("cpu").eval()
         
@@ -3578,9 +3612,9 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 else:
                     if not ignore_dtype:
                         dtype = p.data.dtype
-                        if convertWeightsFloatTo != None and dtype == torch.float32 :
+                        if model_convertWeightsFloatTo != None and dtype == torch.float32 :
                             # convert any left overs float32 weight to bfloat16 / float16 to divide by 2 the model memory footprint
-                            dtype = convertWeightsFloatTo if model_dtype == None else model_dtype
+                            dtype = model_convertWeightsFloatTo if model_dtype == None else model_dtype
                             if dtype != torch.float32:
                                 p.data = p.data.to(dtype)
                         if model_dtype is None:
@@ -3591,7 +3625,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                             assert model_dtype == dtype
                     current_model_size +=  torch.numel(p.data) * p.data.element_size()
         if model_dtype is None:
-            model_dtype = convertWeightsFloatTo if convertWeightsFloatTo is not None else torch.bfloat16
+            model_dtype = model_convertWeightsFloatTo if model_convertWeightsFloatTo is not None else torch.bfloat16
         current_model._dtype = model_dtype
         for b in current_model.buffers():
             # do not convert 32 bits float to 16 bits since buffers are few (and potential gain low) and usually they are needed for precision calculation (for instance Rope)
