@@ -750,12 +750,18 @@ def split_linear_modules(model, map, split_handlers=None, share_fields=None):
                 delattr(parent_module, module_suffix)
 
 
-def detect_safetensors_format(state_dict, verboseLevel=1):
+def _call_quant_handler(fn, *args, metadata=None, **kwargs):
+    if "metadata" in inspect.signature(fn).parameters:
+        kwargs["metadata"] = metadata
+    return fn(*args, **kwargs)
+
+
+def detect_safetensors_format(state_dict, verboseLevel=1, metadata=None):
     matches = []
     details = {}
     priorities = {}
     for handler in _load_handlers():
-        result = handler.detect(state_dict, verboseLevel=verboseLevel)
+        result = _call_quant_handler(handler.detect, state_dict, verboseLevel=verboseLevel, metadata=metadata)
         name = _handler_name(handler)
         details[name] = result
         if result.get("matched", False):
@@ -765,8 +771,8 @@ def detect_safetensors_format(state_dict, verboseLevel=1):
     return {"kind": kind, "found": matches, "details": details, "mixed": len(matches) > 1}
 
 
-def detect_and_convert(state_dict, default_dtype, verboseLevel=1):
-    info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel)
+def detect_and_convert(state_dict, default_dtype, verboseLevel=1, metadata=None):
+    info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel, metadata=metadata)
     kind = info.get("kind", "none")
     matches = info.get("found", []) or []
     if kind in ("none", "quanto") and not matches:
@@ -782,11 +788,13 @@ def detect_and_convert(state_dict, default_dtype, verboseLevel=1):
         if handler is None:
             raise RuntimeError(f"Unsupported quantization format '{kind}'")
         detection = info.get("details", {}).get(matches[0], {})
-        conv = handler.convert_to_quanto(
+        conv = _call_quant_handler(
+            handler.convert_to_quanto,
             state_dict,
             default_dtype=default_dtype,
             verboseLevel=verboseLevel,
             detection=detection,
+            metadata=metadata,
         )
         conv["kind"] = kind
         conv["details"] = info
@@ -809,11 +817,13 @@ def detect_and_convert(state_dict, default_dtype, verboseLevel=1):
         if handler is None:
             continue
         detection = info.get("details", {}).get(name, {})
-        conv = handler.convert_to_quanto(
+        conv = _call_quant_handler(
+            handler.convert_to_quanto,
             merged_state,
             default_dtype=default_dtype,
             verboseLevel=verboseLevel,
             detection=detection,
+            metadata=metadata,
         )
         merged_state = conv.get("state_dict", merged_state)
         merged_map = _merge_quant_maps(merged_map, conv.get("quant_map", {}))
@@ -1004,9 +1014,9 @@ def detect_quantization_kind_for_file(file_path, verboseLevel=1):
             metadata = f.metadata()
         return state_dict, metadata
 
-    def _try_detect(state_dict):
+    def _try_detect(state_dict, metadata):
         try:
-            info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel)
+            info = detect_safetensors_format(state_dict, verboseLevel=verboseLevel, metadata=metadata)
             return info.get("kind"), True
         except Exception:
             return None, False
@@ -1021,11 +1031,11 @@ def detect_quantization_kind_for_file(file_path, verboseLevel=1):
         except Exception:
             return None
 
-    kind, ok = _try_detect(state_dict)
+    kind, ok = _try_detect(state_dict, metadata)
     if metadata_only and not ok:
         try:
             state_dict, metadata = _load_full()
-            kind, ok = _try_detect(state_dict)
+            kind, ok = _try_detect(state_dict, metadata)
         except Exception:
             kind = None
 
