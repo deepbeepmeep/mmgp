@@ -1,4 +1,4 @@
-# ------------------ Memory Management 3.7.14 for the GPU Poor by DeepBeepMeep (mmgp)------------------
+# ------------------ Memory Management 3.8.0 for the GPU Poor by DeepBeepMeep (mmgp)------------------
 #
 # This module contains multiples optimisations so that models such as Flux (and derived), Mochi, CogView, HunyuanVideo, ...  can run smoothly on a 24 GB GPU limited card. 
 # This a replacement for the accelerate library that should in theory manage offloading, but doesn't work properly with models that are loaded / unloaded several
@@ -64,6 +64,9 @@ import inspect
 import psutil
 import builtins
 import fnmatch
+import traceback
+from contextlib import contextmanager
+from contextvars import ContextVar
 from accelerate import init_empty_weights
 from functools import wraps
 import functools
@@ -638,7 +641,7 @@ def _pin_sd_to_memory(sd, sd_name, tied_weights = None, gig_tensor_size = BIG_TE
     return 
 
 
-def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1):
+def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = True, big_tensor_size = BIG_TENSOR_MAX_SIZE, perc_reserved_mem_max = 0,verboseLevel = 1, loading_callback=None):
 
     global max_pinnable_bytes, total_pinned_bytes
     if max_pinnable_bytes > 0 and  total_pinned_bytes >= max_pinnable_bytes:
@@ -775,6 +778,7 @@ def _pin_to_memory(model, model_id, partialPinning = False, pinnedPEFTLora = Tru
 
             big_tensor_no, offset, length = tensor_map_indexes[tensor_no]
             if last_allocated_big_tensor <  big_tensor_no:
+                if loading_callback is not None: loading_callback.check_abort()
                 last_allocated_big_tensor += 1
                 size = max(big_tensors_sizes[last_allocated_big_tensor], BIG_TENSOR_MIN_SIZE) 
                 try:
@@ -840,7 +844,7 @@ def _welcome():
     if welcome_displayed:
          return 
     welcome_displayed = True
-    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.7.14) by DeepBeepMeep ************{ENDC}{UNBOLD}")
+    print(f"{BOLD}{HEADER}************ Memory Management for the GPU Poor (mmgp 3.8.0) by DeepBeepMeep ************{ENDC}{UNBOLD}")
 
 def change_dtype(model, new_dtype, exclude_buffers = False):
     for submodule_name, submodule in model.named_modules():  
@@ -1835,6 +1839,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
     """       
 
     
+    _report_loading("Reading Configuration", 0, 2, model_path)
     import os.path
     if not isinstance(model_path, list):
         model_path = [model_path]
@@ -1893,6 +1898,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
             config_obj = AutoConfig.from_pretrained(fp.name)     
         os.remove(fp.name)
         #needed to keep inits of non persistent buffers
+        _report_loading("Building", 1, 2, model_path)
         with init_empty_weights():
             model = transfomer_class(config_obj)
 
@@ -1906,6 +1912,7 @@ def fast_load_transformers_model(model_path: str,  do_quantize = False, quantiza
         else:
             raise Exception("class not defined")                
 
+        _report_loading("Building", 1, 2, model_path)
         with init_empty_weights():
             model = transfomer_class.from_config(transformer_config )
 
@@ -2054,6 +2061,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     """
     Load a model, detect if it has been previously quantized using quanto and do the extra setup if necessary
     """
+    _report_loading("Reading Weights", 0, 3, file_path)
     if isinstance(preprocess_sd, dict):
         preprocess_fn = lambda sd, qm, twm: map_state_dict([sd, qm, twm], rules=preprocess_sd)
     else:
@@ -2093,6 +2101,8 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
     full_tied_weights_map = {}
     full_state_dict = {}
     for no, file in enumerate(file_path):
+        if no:
+            _report_loading("Reading Weights", 0, 3, file)
         quantization_map = None
         hybrid_quantization_map = False
         tied_weights_map = None
@@ -2162,6 +2172,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 with open(quantization_map_path, 'r') as f:
                     quantization_map = json.load(f)
 
+        _report_loading("Preparing Weights", 1, 3, file)
         if preprocess_fn != None:
             num_params = len(inspect.signature(preprocess_fn).parameters)
             state_dict = preprocess_fn(*[state_dict, quantization_map, tied_weights_map][:num_params])
@@ -2241,6 +2252,7 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
             verboseLevel=verboseLevel,
         )
 
+    _report_loading("Applying Weights", 2, 3, file_path)
     post_load_hooks = []
     if quantization_map:
         quantization_map, post_load_hooks = apply_pre_quantization(
@@ -2357,8 +2369,11 @@ def load_model_data(model, file_path, do_quantize = False, quantizationType = qi
                 quantization_map = model._quanto_map  
 
     if pinToMemory:
-        _pin_to_memory(model, file_path, partialPinning = partialPinning, verboseLevel = verboseLevel)
+        _report_loading("Pinning", 2, 3, file_path)
+        context = _loading_context.get()
+        _pin_to_memory(model, file_path, partialPinning = partialPinning, verboseLevel = verboseLevel, loading_callback=None if context is None else context[0])
 
+    _report_loading("Weights Loaded", 3, 3, file_path)
     return
 
 def save_model(model, file_path, do_quantize = False, quantizationType = qint8, verboseLevel = -1, config_file_path = None, filter_sd =None, quantize_exclude = None):
@@ -3483,7 +3498,75 @@ def {fname}(module, *args, **kwargs):
 
 
 
-def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1):
+class LoadingCancelled(Exception):
+    """Loading was cancelled; discard the interrupted pipeline."""
+
+
+_loading_context = ContextVar("mmgp_loading_context", default=None)
+
+
+@contextmanager
+def loading_context(callback, model_ids=None):
+    """Forward optional progress through model construction and checkpoint loading."""
+    if callback is None:
+        yield
+        return
+    model_ids = {} if model_ids is None else {os.path.normcase(os.path.abspath(path)): name for path, name in model_ids.items()}
+    token = _loading_context.set((callback, model_ids))
+    try:
+        callback.report("Preparing Models", 0, 1, "")
+        yield
+    finally:
+        _loading_context.reset(token)
+
+
+def _report_loading(phase, completed, total, paths):
+    context = _loading_context.get()
+    if context is None:
+        return
+    callback, model_ids = context
+    paths = paths if isinstance(paths, list) else [paths]
+    model_id = next((model_ids[os.path.normcase(os.path.abspath(path))] for path in paths if isinstance(path, str) and os.path.normcase(os.path.abspath(path)) in model_ids), "")
+    callback.report(phase, completed, total, model_id)
+
+
+class LoadingCallback:
+    def __init__(self, abort_requested=None, progress=None):
+        self.abort_requested = abort_requested
+        self.progress = progress
+
+    def check_abort(self):
+        if self.abort_requested is not None and self.abort_requested():
+            raise LoadingCancelled("Model loading cancelled")
+
+    def report(self, phase, completed, total, model_id):
+        self.check_abort()
+        if self.progress is not None:
+            self.progress(phase, completed, total, model_id)
+        self.check_abort()
+
+
+def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None):
+    """Configure offloading, optionally reporting phases and accepting cancellation."""
+    global total_pinned_bytes, max_pinnable_bytes, last_offload_obj
+    kwargs = locals().copy()
+    pinned_stats = total_pinned_bytes, max_pinnable_bytes
+    previous_device, previous_offload = torch.get_default_device(), last_offload_obj
+    self = offload()
+    try:
+        return _configure(self, **kwargs)
+    except LoadingCancelled as error:
+        # Drop interrupted pinning frames before releasing their model references.
+        traceback.clear_frames(error.__traceback__)
+        error.__traceback__ = None
+        self.release()
+        total_pinned_bytes, max_pinnable_bytes = pinned_stats
+        last_offload_obj = previous_offload
+        torch.set_default_device(previous_device)
+        raise error from None
+
+
+def _configure(self, pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, partialPinning = False, loras = None, quantizeTransformer = True,  extraModelsToQuantize = None, quantizationType = qint8, budgets= 0, workingVRAM = None, asyncTransfers = True, compile = False, convertWeightsFloatTo = torch.bfloat16, perc_reserved_mem_max = 0, coTenantsMap = None, vram_safety_coefficient = 0.8, compile_mode ="default", verboseLevel = -1, loading_callback=None):
     """Hook to a pipeline or a group of modules in order to reduce their VRAM requirements:
     pipe_or_dict_of_modules : the pipeline object or a dictionary of modules of the model
     quantizeTransformer: set True by default will quantize on the fly the video / image model
@@ -3496,7 +3579,6 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     vram_safety_coefficient: float between 0 and 1 (exclusive), default 0.8. Sets the maximum portion of VRAM that can be used for models.
         Lower values provide more safety margin but may reduce performance.        
     """
-    self = offload()
     self.verboseLevel = verboseLevel
     safetensors2.verboseLevel = verboseLevel
     self.modules_data = {}
@@ -3585,17 +3667,29 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
     perc_reserved_mem_max = _get_perc_reserved_mem_max(perc_reserved_mem_max)
     max_reservable_memory = _get_max_reservable_memory(perc_reserved_mem_max) 
 
+    phase_no = 0
+    phase_total = 4 * len(models) + sum(model_id in models_to_quantize for model_id in models) + sum((pinAllModels or model_id in modelsToPin) and not hasattr(model, "_already_pinned") for model_id, model in models.items())
+
+    def loading_phase(phase, model_id):
+        nonlocal phase_no
+        if loading_callback is not None: loading_callback.report(phase, phase_no, phase_total, model_id)
+        phase_no += 1
+
     estimatesBytesToPin = 0
     for model_id in models: 
+        if loading_callback is not None: loading_callback.check_abort()
         current_model: torch.nn.Module = models[model_id] 
+        loading_phase("Preparing", model_id)
         model_convertWeightsFloatTo = getattr(current_model, "_convertWeightsFloatTo", convertWeightsFloatTo)
         # make sure that no RAM or GPU memory is not allocated for gradiant / training
         current_model.to("cpu").eval()
         
         # if the model has just been quantized so there is no need to quantize it again
         if model_id in models_to_quantize:
+            loading_phase("Quantization", model_id)
             _quantize(current_model, weights=quantizationType, verboseLevel = self.verboseLevel, model_id=model_id)
 
+        loading_phase("Scanning Sizes", model_id)
         modelPinned = (pinAllModels or model_id in modelsToPin) and not hasattr(current_model,"_already_pinned")
 
         current_model_size = 0
@@ -3674,6 +3768,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
 
     #  Hook forward methods of modules 
     for model_id in models: 
+        if loading_callback is not None: loading_callback.check_abort()
         current_model: torch.nn.Module = models[model_id] 
         current_model._force_device= "cuda"
         towers_names, towers_modules = _detect_main_towers(current_model)
@@ -3684,8 +3779,10 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                 if self.verboseLevel >=1:
                     print(f"Model '{model_id}' already pinned to reserved memory")
             else:
-                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel)            
+                loading_phase("Pinning", model_id)
+                _pin_to_memory(current_model, model_id, partialPinning= partialPinning, pinnedPEFTLora = pinnedPEFTLora, perc_reserved_mem_max = perc_reserved_mem_max, verboseLevel=verboseLevel, loading_callback=loading_callback)            
 
+        loading_phase("Hooks and LoRA Slots", model_id)
         current_budget = getattr(current_model, "_budget", model_budgets[model_id])
         cur_blocks_prefix, prev_blocks_name, cur_blocks_name,cur_blocks_seq, is_mod_seq = None, None, None, -1, False
         self.loaded_blocks[model_id] = None
@@ -3753,6 +3850,7 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
                     self.add_module_to_blocks(model_id, cur_blocks_name, submodule, prev_blocks_name, submodule_name)
 
 
+        loading_phase("Finalization", model_id)
         # compile main iterative modules stacks ("towers")
         if compilationInThisOne:
             if self.verboseLevel>=1:
@@ -3794,11 +3892,15 @@ def all(pipe_or_dict_of_modules, pinnedMemory = False, pinnedPEFTLora = False, p
             print_size_range(prev_pre,start_num,prev_num, prev_size )
 
   
+    if loading_callback is not None: loading_callback.report("Finalization", phase_total, phase_total, "")
     torch.set_default_device('cuda')
     torch.cuda.empty_cache()
     gc.collect()         
 
     return self
+
+
+all.__doc__ = _configure.__doc__
 
 
 def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.VerylowRAM_LowVRAM, verboseLevel = -1, **overrideKwargs):
@@ -3832,7 +3934,9 @@ def profile(pipe_or_dict_of_modules, profile_no: profile_type =  profile_type.Ve
     
     models_to_scan = ("text_encoder", "text_encoder_2")
     candidates_to_quantize = ("t5", "llama", "llm")
+    loading_callback = overrideKwargs.get("loading_callback")
     for model_id  in models_to_scan:
+        if loading_callback is not None: loading_callback.check_abort()
         if model_id in module_names: 
             name = module_names[model_id]
             for candidate in candidates_to_quantize:
