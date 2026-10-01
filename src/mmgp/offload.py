@@ -85,6 +85,8 @@ from .quant_router import (
     split_fused_weights,
     get_extension_handler,
     normalize_extension_path,
+    _get_split_handler,
+    _call_split_handler,
 )
 from optimum.quanto import freeze,  qfloat8, qint4 , qint8, quantize, QModuleMixin, QLinear, QTensor,  quantize_module, register_qmodule
 # support for Embedding module quantization that is not supported by default by quanto
@@ -1439,7 +1441,22 @@ def load_loras_into_model(model, lora_path, lora_multi = None, activate_all_lora
                             if not module_name.endswith(suffix) or (map := split_linear_modules_map.get(name_parts[pos], None)) is None:
                                 continue
                             parent_module_name = ".".join(name_parts[:pos])
-                            sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else (module_data,) * len(map["mapped_modules"])
+                            # A LoRA's up / B rows index the module's OUTPUT channels, so they
+                            # must be cut exactly the way the module's own weight rows are cut.
+                            # Reuse the "weight" handler the model declared in its split map --
+                            # the same one sd_split_linear() honours when splitting the
+                            # checkpoint. Without it a fused projection whose rows are not laid
+                            # out contiguously per target module (e.g. head-interleaved QKV) is
+                            # silently scrambled: every shape still matches, so nothing raises.
+                            sub_data = _call_split_handler(
+                                _get_split_handler(map, "weight", None) if any_split else None,
+                                src=module_data,
+                                dim=0,
+                                split_sizes=map["split_sizes"],
+                                context={"info": map, "field": suffix[1:], "split_dim": 0},
+                            )
+                            if sub_data is None:
+                                sub_data = torch.split(module_data, map["split_sizes"], dim=0) if any_split else (module_data,) * len(map["mapped_modules"])
                             for sub_name, subdata in zip(map["mapped_modules"], sub_data):
                                 new_state_dict[parent_module_name + "." + sub_name + suffix] = subdata
                             break
